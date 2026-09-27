@@ -80,6 +80,7 @@ Item {
   property var subscriptions: []
   property var rules: []               // ours, from `omihomo rule list`
   property var subscriptionRules: []   // the subscription's, read-only
+  signal ruleAdded()
   property var groups: []
   property var configEntries: ({})     // config name -> `GET /proxies` entry
   // Whether `/proxies` has answered for this run of the core. An empty `groups`
@@ -124,6 +125,7 @@ Item {
   readonly property var primaryGroupEntry: Model.groupByName(groups, primaryGroup)
   readonly property string currentConfig: primaryGroupEntry ? primaryGroupEntry.now : ""
   readonly property bool busy: coreCmd.running || subActionCmd.running || overrideCmd.running || apiActionCmd.running
+  readonly property bool ruleSaving: overrideCmd.running && _overrideAction === "ruleAdd"
   readonly property bool pingTestsRunning: delayCmd.running || groupDelayCmd.running
 
   readonly property int refreshIntervalSec: {
@@ -440,10 +442,14 @@ Item {
   }
 
   function addRule(type, value, target) {
-    if (overrideCmd.running) return
+    if (overrideCmd.running) return false
     reportDone("")
-    _overrideAction = "rule"
-    if (!overrideCmd.launch(cli(["rule", "add", type, value, target]))) _overrideAction = ""
+    _overrideAction = "ruleAdd"
+    if (!overrideCmd.launch(cli(["rule", "add", type, value, target]))) {
+      _overrideAction = ""
+      return false
+    }
+    return true
   }
 
   function removeRule(index) {
@@ -806,7 +812,10 @@ Item {
         else if (action === "tailscale") root._desiredTailscaleEnabled = -1
         root.reportError(code, err)
       }
-      else root.reportDone("")
+      else {
+        root.reportDone("")
+        if (action === "ruleAdd") root.ruleAdded()
+      }
       root.settle()
     }
   }
