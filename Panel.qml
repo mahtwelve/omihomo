@@ -476,6 +476,7 @@ Panel {
   }
 
   function openRuleForm() {
+    omihomo.clearMessages()
     ruleValueRow.field.text = ""
     ruleFormOpen = true
     Qt.callLater(function() { root.focusRow("ruleValue"); root.beginEdit(ruleValueRow.field) })
@@ -484,8 +485,6 @@ Panel {
   function submitRuleForm() {
     if (ruleFormError !== "") return
     omihomo.addRule(ruleType, ruleFormValue, ruleTarget)
-    ruleFormOpen = false
-    endEdit()
   }
 
   function openFilter() {
@@ -600,6 +599,10 @@ Panel {
     panelOpen: root.opened
     connectionsOpen: root.opened && root.view === "connections"
     onConfigChanged: root.omihomoConfigChanged()
+    onRuleAdded: {
+      root.ruleFormOpen = false
+      root.endEdit()
+    }
   }
 
   // A new config means a new egress path, which is one of the three events
@@ -1400,9 +1403,20 @@ Panel {
                 width: parent.width
                 section: "ruleSubmit"
                 title: "Add rule"
-                trailing: root.ruleFormError !== "" ? root.ruleFormError : "enter"
+                trailing: root.ruleFormError !== "" ? root.ruleFormError
+                  : (omihomo.ruleSaving ? "saving…" : "enter")
                 urgentTrailing: root.ruleFormError !== ""
                 onActivated: root.submitRuleForm()
+              }
+
+              Text {
+                visible: omihomo.lastError !== ""
+                width: parent.width
+                text: omihomo.lastError
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
               }
             }
           }

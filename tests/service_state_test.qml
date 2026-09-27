@@ -8,6 +8,8 @@ ShellRoot {
   id: testRoot
 
   property bool passed: true
+  property int savedRuleNotifications: 0
+  property int failedRuleNotifications: 0
 
   Omihomo.Service {
     id: coreService
@@ -26,6 +28,16 @@ ShellRoot {
 
   Omihomo.Service { id: failingCoreService; cliPath: "/usr/bin/false" }
   Omihomo.Service { id: failingTunService; cliPath: "/usr/bin/false" }
+  Omihomo.Service {
+    id: savedRuleService
+    cliPath: "/usr/bin/true"
+    onRuleAdded: testRoot.savedRuleNotifications++
+  }
+  Omihomo.Service {
+    id: failedRuleService
+    cliPath: "/usr/bin/false"
+    onRuleAdded: testRoot.failedRuleNotifications++
+  }
   Omihomo.Service { id: staleApiService; cliPath: "/usr/bin/true" }
   Omihomo.Service { id: redirectService; cliPath: "/usr/bin/true" }
   Omihomo.Service { id: snapshotService; cliPath: "/usr/bin/true" }
@@ -51,12 +63,16 @@ ShellRoot {
     interval: 10
     repeat: true
     onTriggered: {
-      if (failingCoreService.busy || failingTunService.busy) return
+      if (failingCoreService.busy || failingTunService.busy
+          || savedRuleService.busy || failedRuleService.busy) return
       stop()
       check(failingCoreService.coreActive, false, "failed core command rolls back")
       check(failingCoreService._desiredCoreRunning, -1, "failed core command clears desired state")
       check(failingTunService.tunActive, false, "failed TUN command rolls back")
       check(failingTunService._desiredTunEnabled, -1, "failed TUN command clears desired state")
+      check(savedRuleNotifications, 1, "successful rule write confirms the add form")
+      check(failedRuleNotifications, 0, "failed rule write does not confirm the add form")
+      check(failedRuleService.lastError !== "", true, "failed rule write exposes an error")
       settleCheck.start()
     }
   }
@@ -149,6 +165,14 @@ ShellRoot {
     failingTunService.applyStatus(status("on", false, false))
     failingTunService.toggleTun()
     check(failingTunService.tunActive, true, "failed TUN command starts optimistically")
+
+    check(savedRuleService.addRule("DOMAIN-SUFFIX", "steamcontent.com", "DIRECT"), true,
+      "rule write starts")
+    check(savedRuleNotifications, 0, "rule form waits for the write result")
+    check(savedRuleService.addRule("DOMAIN-SUFFIX", "steamcontent.com", "DIRECT"), false,
+      "a second rule write is rejected while the first is running")
+    check(failedRuleService.addRule("DOMAIN-SUFFIX", "steamcontent.com", "DIRECT"), true,
+      "failed rule write still starts")
 
     // A rotated controller secret leaves the panel authenticated with the old
     // one, and every read comes back 401 while `omihomo status` — which reads
