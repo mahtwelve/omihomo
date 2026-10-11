@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, next]
 
 permissions:
   contents: read
@@ -15,8 +15,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The go line of go.mod resolves to its newest patch release, so the
-      # standard library govulncheck sees is the one a release would ship.
+      # go.mod names the patch release, so builds and govulncheck use at
+      # least the standard library it was checked against.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -31,15 +31,31 @@ jobs:
 
   widget:
     runs-on: ubuntu-latest
+    # Arch packages Quickshell, the runtime the QML service tests need.
+    container: archlinux:base@sha256:4e77cf2ea5f410e6f8be5abf93ccf17ce2436e87a138c167208356711a405dbd
     steps:
+      - name: install tools
+        run: pacman -Syu --noconfirm --needed git nodejs jq go-yq curl quickshell
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      # The Omarchy shell imports Service.qml uses, from the release the
+      # widget targets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: lts/*
-      # The runner image ships mikefarah's yq v4, which the CLI tests need.
-      # Quickshell and the Omarchy shell imports are absent, so tests/run
-      # skips the QML service tests and runs the model and CLI suites.
+          repository: basecamp/omarchy
+          ref: c668141e9c42b13c80c9ca4ea108e11708c5e8a5 # v4.0.4
+          path: .omarchy
+          sparse-checkout: shell/Commons
+          persist-credentials: false
+      - name: install Omarchy shell imports
+        run: |
+          install -d /usr/share/omarchy/shell
+          cp -r .omarchy/shell/Commons /usr/share/omarchy/shell/
+          rm -rf .omarchy
+      # As an ordinary account, the way the suites run on a desktop.
       - name: tests/run
-        run: ./tests/run
+        run: |
+          useradd --create-home tester
+          chown -R tester: .
+          runuser -u tester -- env OMIHOMO_REQUIRE_QML=1 ./tests/run

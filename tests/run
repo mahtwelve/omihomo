@@ -12,6 +12,9 @@ node --test "$here/model_test.js"
 if command -v qs >/dev/null 2>&1 && [[ -d /usr/share/omarchy/shell/Commons ]]; then
   "$here/service_state_test.sh"
   "$here/fake_controller_test.sh"
+elif [[ ${OMIHOMO_REQUIRE_QML:-0} == 1 ]]; then
+  printf 'QML service tests need Quickshell and the Omarchy shell imports\n' >&2
+  exit 2
 else
   printf 'skipping QML service tests: Quickshell or Omarchy shell imports are not installed\n'
 fi
