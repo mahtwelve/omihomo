@@ -34,6 +34,8 @@ Item {
   property bool tunRedirect: false
   property bool autostartEnabled: false
   property bool permissionsOk: false
+  property bool hardeningPending: false
+  property int _syncAttempts: 0
   property bool tailscaleEnabled: false
   // Whether tailscaled is on this machine at all. The panel hides the row
   // rather than offering a toggle that can only fail.
@@ -78,13 +80,18 @@ Item {
   readonly property string apiHeader: "Authorization: Bearer " + apiSecret + "\n"
   property int mixedPort: 0
   property string mode: ""
+  property var routing: ({})
   property string _desiredMode: ""
   readonly property string effectiveMode: _desiredMode !== "" ? _desiredMode : mode
 
   // ---- data ---------------------------------------------------------------
   property var subscriptions: []
   property var rules: []               // ours, from `omihomo rule list`
-  property var subscriptionRules: []   // the subscription's, read-only
+  property var injectedRuleSpecs: []   // Omihomo's, from `omihomo rule injected`
+  property var apiRules: []            // the runtime's merged list, from `GET /rules`
+  readonly property var ruleLayers: Model.splitApiRules(apiRules, rules, injectedRuleSpecs)
+  readonly property var injectedRules: ruleLayers.injected            // Omihomo's, read-only
+  readonly property var subscriptionRules: ruleLayers.subscription   // the subscription's, read-only
   signal ruleAdded()
   property var groups: []
   property var configEntries: ({})     // config name -> `GET /proxies` entry
@@ -97,6 +104,9 @@ Item {
   // core started, open or closed, and `connectionStacks` is what the view
   // draws — one row per process, destination, and state.
   property var connectionLog: []
+  property var _pendingConnections: null
+  property string _connectionLookupRuntime: ""
+  property string _connectionReadRuntime: ""
   readonly property var connectionStacks: Model.stackConnections(connectionLog)
   readonly property int openConnectionCount: Model.openConnectionCount(connectionLog)
   readonly property int connectionLogCap: 200
@@ -105,6 +115,9 @@ Item {
 
   property double downloadRate: 0
   property double uploadRate: 0
+  // The last minute of `/traffic`, oldest first, one { down, up } per second.
+  property var trafficHistory: []
+  readonly property int trafficHistoryCap: 60
   property string egressIp: ""
   property int egressLatency: 0
   property bool traceTesting: false
@@ -117,12 +130,19 @@ Item {
   property var configTestResults: ({}) // config name -> { state, delay }
   property string _singleTestName: ""
   property var _groupTestNames: []
+  property string _groupTestName: ""
+  property var groupTestedAt: ({})     // group name -> ms of its last whole-group test
   property string pendingConfig: ""
   property string pendingSubscription: ""
 
   property string actionStatus: ""
   property string lastError: ""
   property int lastErrorCode: 0
+  // Where the failed action lives, so the panel can show the error next to it:
+  // "core", "configs", "rules", "conns", "settings", or "sub:<name>" ("sub:"
+  // for an add).
+  property string errorScope: ""
+  property string _subTarget: ""
   property string _coreAction: ""
   property string _overrideAction: ""
 
@@ -153,7 +173,7 @@ Item {
   }
 
   function apiArgs(method, path, body) {
-    var args = ["curl", "-fsS", "--max-time", "6", "-H", "@-"]
+    var args = ["curl", "-fsS", "--max-time", "6", "--max-filesize", "16M", "-H", "@-"]
     if (method !== "GET") args.push("-X", method)
     if (body !== undefined && body !== "") args.push("-H", "Content-Type: application/json", "--data", body)
     args.push("http://" + apiAddress + path)
@@ -179,10 +199,11 @@ Item {
     proxiesLoaded = false
   }
 
-  function reportError(code, stderr) {
+  function reportError(code, stderr, scope) {
     var error = Model.cliError(stderr, code)
     lastError = error.message
     lastErrorCode = error.code
+    errorScope = scope || "core"
     actionStatus = ""
     statusClearTimer.restart()
   }
@@ -190,6 +211,7 @@ Item {
   function reportDone(message) {
     lastError = ""
     lastErrorCode = 0
+    errorScope = ""
     actionStatus = message || ""
     if (actionStatus !== "") statusClearTimer.restart()
   }
@@ -198,6 +220,7 @@ Item {
     actionStatus = ""
     lastError = ""
     lastErrorCode = 0
+    errorScope = ""
   }
 
   // ---- reads --------------------------------------------------------------
@@ -212,6 +235,7 @@ Item {
     if (!panelOpen) return
     subsCmd[read](cli(["sub", "list"]))
     rulesCmd[read](cli(["rule", "list"]))
+    injectedRulesCmd[read](cli(["rule", "injected"]))
   }
 
   function refreshLive(afterWrite) {
@@ -230,7 +254,7 @@ Item {
   // looking at it.
   function refreshConnections() {
     if (!apiReady || !panelOpen) return
-    connectionsCmd.launch(apiArgs("GET", "/connections"))
+    if (connectionsCmd.launch(apiArgs("GET", "/connections"))) _connectionReadRuntime = runtimeKey
   }
 
   // IP and latency are the only fields that cost a network round trip, so they
@@ -246,7 +270,7 @@ Item {
       return
     }
     _traceQueued = false
-    if (!traceCmd.relaunch(["curl", "-fsS", "--max-time", "8", "-w", "\n%{time_total}",
+    if (!traceCmd.relaunch(["curl", "-fsS", "--max-time", "8", "--max-filesize", "64K", "-w", "\n%{time_total}",
       "-x", "http://127.0.0.1:" + mixedPort, "https://cloudflare.com/cdn-cgi/trace"]))
       traceTesting = false
   }
@@ -282,6 +306,7 @@ Item {
     tunRedirect = status.tunRedirect
     autostartEnabled = status.autostartEnabled
     permissionsOk = status.permissionsOk
+    hardeningPending = status.hardeningPending
     tailscaleEnabled = status.tailscaleEnabled
     tailscalePresent = status.tailscalePresent
     tailnetProxy = status.tailnetProxy
@@ -306,6 +331,7 @@ Item {
     if (!coreRunning) {
       downloadRate = 0
       uploadRate = 0
+      trafficHistory = []
       traceTesting = false
       _traceQueued = false
     }
@@ -322,17 +348,22 @@ Item {
     groups = []
     configEntries = ({})
     connectionLog = []
+    _pendingConnections = null
+    routing = ({})
     proxiesLoaded = false
     mixedPort = 0
     configTestResults = ({})
     _singleTestName = ""
     _groupTestNames = []
+    groupTestedAt = ({})
+    trafficHistory = []
   }
 
   function applyConfigs(raw) {
     var parsed = Model.parseConfigs(raw)
     mode = parsed.mode
     mixedPort = parsed.mixedPort > 0 ? parsed.mixedPort : parsed.port
+    routing = parsed.routing
     if (_desiredMode !== "" && mode === _desiredMode) _desiredMode = ""
     runQueuedTrace()
   }
@@ -346,6 +377,7 @@ Item {
   // Called when the settle deadline passes with a change still unconfirmed.
   function abandonDesired() {
     if (!pendingDesired()) return
+    var scope = _desiredCoreRunning !== -1 ? "core" : "settings"
     _desiredCoreRunning = -1
     _desiredTunEnabled = -1
     _desiredTunRedirect = -1
@@ -353,7 +385,7 @@ Item {
     _desiredTailscaleEnabled = -1
     _desiredTailnetProxy = -1
     _desiredMode = ""
-    reportError(1, "mihomo did not reach the requested state")
+    reportError(1, "mihomo did not reach the requested state", scope)
   }
 
   // ---- writes -------------------------------------------------------------
@@ -377,8 +409,8 @@ Item {
   }
 
   function repairCore() {
-    if (permissionsOk) return
-    runCore(["core", "repair"], "Repairing permissions…", "repair")
+    if (permissionsOk && !hardeningPending) return
+    runCore(["core", "repair"], "Repairing…", "repair")
   }
 
   // Autostart is systemd's `enable`, so it goes through the CLI like the rest
@@ -486,13 +518,16 @@ Item {
   // mark pending: the name only exists once the fetch has come back.
   function addSubscription(url) {
     if (subActionCmd.running) return
+    _subTarget = ""
     reportDone("Fetching subscription…")
-    subActionCmd.launch(cli(["sub", "add", url]))
+    subActionCmd.input = url + "\n"
+    if (!subActionCmd.launch(cli(["sub", "add"]))) subActionCmd.input = ""
   }
 
   function updateSubscription(name) {
     if (subActionCmd.running || name === "") return
     pendingSubscription = name
+    _subTarget = name
     reportDone("Updating " + name + "…")
     subActionCmd.launch(cli(["sub", "update", name]))
   }
@@ -500,6 +535,7 @@ Item {
   function activateSubscription(name) {
     if (subActionCmd.running || name === "") return
     pendingSubscription = name
+    _subTarget = name
     reportDone("Activating " + name + "…")
     subActionCmd.launch(cli(["sub", "activate", name]))
   }
@@ -507,6 +543,7 @@ Item {
   function removeSubscription(name) {
     if (subActionCmd.running || name === "") return
     pendingSubscription = name
+    _subTarget = name
     reportDone("")
     subActionCmd.launch(cli(["sub", "remove", name]))
   }
@@ -586,6 +623,7 @@ Item {
     var names = group && group.all ? group.all.slice() : []
     if (names.length === 0) return
     _groupTestNames = names
+    _groupTestName = name
     startConfigTests(names)
     // The controller tests the group's configs concurrently. Process keeps
     // that bulk request asynchronous from the panel's render loop.
@@ -687,7 +725,22 @@ Item {
 
   Cmd {
     id: syncCmd
-    onFinished: root.refresh(true)
+    onFinished: function(code, out, err) {
+      if (code !== 0) {
+        root.reportError(code, err, "core")
+        if (root._syncAttempts < 3) syncRetry.restart()
+      }
+      root.refresh(true)
+    }
+  }
+
+  Timer {
+    id: syncRetry
+    interval: 30000
+    onTriggered: {
+      root._syncAttempts += 1
+      syncCmd.launch(root.cli(["core", "sync"]))
+    }
   }
 
   Cmd {
@@ -721,10 +774,18 @@ Item {
   }
 
   Cmd {
+    id: injectedRulesCmd
+    onFinished: function(code, out) {
+      var specs = code === 0 ? Model.parseJson(out, []) : []
+      root.injectedRuleSpecs = Array.isArray(specs) ? specs : []
+    }
+  }
+
+  Cmd {
     id: apiRulesCmd
     input: root.apiHeader
     onFinished: function(code, out) {
-      root.subscriptionRules = code === 0 ? Model.stripOwnRules(Model.parseApiRules(out), root.rules) : []
+      root.apiRules = code === 0 ? Model.parseApiRules(out) : []
       if (code !== 0) root.noteApiFailure(code)
     }
   }
@@ -755,13 +816,48 @@ Item {
     id: connectionsCmd
     input: root.apiHeader
     onFinished: function(code, out) {
+      if (root._connectionReadRuntime !== root.runtimeKey) return
       if (code !== 0) return root.noteApiFailure(code)
-      var now = Date.now()
-      var parsed = Model.parseConnections(out, now)
-      root.connectionLog = Model.mergeConnectionLog(root.connectionLog, parsed.items, now,
-        root.connectionLogCap)
-      root.connectionsDownload = parsed.downloadTotal
-      root.connectionsUpload = parsed.uploadTotal
+      root.applyConnections(out)
+    }
+  }
+
+  /** Records a controller snapshot and looks up missing process names. */
+  function applyConnections(out) {
+    var now = Date.now()
+    var parsed = Model.parseConnections(out, now)
+    connectionLog = Model.mergeConnectionLog(connectionLog, parsed.items, now, connectionLogCap)
+    connectionsDownload = parsed.downloadTotal
+    connectionsUpload = parsed.uploadTotal
+    if (cliPath !== "" && parsed.items.some(function(entry) {
+      return entry.process === "" && entry.inboundType === "Tun"
+    }) && socketProcessesCmd.launch(cli(["socket-processes"]))) {
+      _pendingConnections = parsed
+      _connectionLookupRuntime = runtimeKey
+    }
+  }
+
+  /** Enriches matching open connections from a lookup for the current core run. */
+  function finishConnections(socketTable) {
+    var parsed = _pendingConnections
+    _pendingConnections = null
+    if (!parsed || _connectionLookupRuntime !== runtimeKey || !socketTable) return
+    var candidates = Object.create(null)
+    parsed.items.forEach(function(entry) { candidates[entry.id] = entry })
+    connectionLog = connectionLog.map(function(entry) {
+      var candidate = candidates[entry.id]
+      if (!entry.open || !candidate || candidate.network !== entry.network
+        || candidate.sourceIP !== entry.sourceIP || candidate.sourcePort !== entry.sourcePort
+        || candidate.destinationIP !== entry.destinationIP || candidate.destinationPort !== entry.destinationPort)
+        return entry
+      return Model.enrichConnections([entry], socketTable)[0]
+    })
+  }
+
+  Cmd {
+    id: socketProcessesCmd
+    onFinished: function(code, out) {
+      root.finishConnections(code === 0 ? Model.parseJson(out, null) : null)
     }
   }
 
@@ -805,9 +901,15 @@ Item {
     input: root.apiHeader
     onFinished: function(code, out) {
       var names = root._groupTestNames
+      var group = root._groupTestName
       root._groupTestNames = []
+      root._groupTestName = ""
       if (names.length === 0) return
       root.finishConfigTests(names, code === 0 ? Model.parseGroupDelay(out) : {})
+      var tested = {}
+      for (var name in root.groupTestedAt) tested[name] = root.groupTestedAt[name]
+      tested[group] = Date.now()
+      root.groupTestedAt = tested
     }
   }
 
@@ -819,7 +921,7 @@ Item {
       if (code !== 0) {
         if (action === "core") root._desiredCoreRunning = -1
         else if (action === "autostart") root._desiredAutostartEnabled = -1
-        root.reportError(code, err)
+        root.reportError(code, err, action === "core" ? "core" : "settings")
       }
       else root.reportDone("")
       root.settle()
@@ -829,8 +931,9 @@ Item {
   Cmd {
     id: subActionCmd
     onFinished: function(code, out, err) {
+      input = ""
       root.pendingSubscription = ""
-      if (code !== 0) root.reportError(code, err)
+      if (code !== 0) root.reportError(code, err, "sub:" + root._subTarget)
       else root.reportDone("")
       root.settle()
     }
@@ -847,7 +950,8 @@ Item {
         else if (action === "tunRedirect") root._desiredTunRedirect = -1
         else if (action === "tailscale") root._desiredTailscaleEnabled = -1
         else if (action === "tailnetProxy") root._desiredTailnetProxy = -1
-        root.reportError(code, err)
+        root.reportError(code, err, action === "group" ? "configs"
+          : (action === "ruleAdd" || action === "rule" ? "rules" : "settings"))
       }
       else {
         root.reportDone("")
@@ -867,7 +971,7 @@ Item {
       var wasSelection = root.pendingConfig !== ""
       if (code !== 0) {
         root.confirmSelection()
-        root.reportError(12, err)
+        root.reportError(12, err, wasSelection ? "configs" : "conns")
         root.noteApiFailure(code)
       }
       else {
@@ -930,6 +1034,9 @@ Item {
         trafficRetry.attempt = 0
         root.downloadRate = traffic.down
         root.uploadRate = traffic.up
+        var history = root.trafficHistory.slice(1 - root.trafficHistoryCap)
+        history.push({ down: traffic.down, up: traffic.up })
+        root.trafficHistory = history
       }
     }
     onExited: {

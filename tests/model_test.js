@@ -54,34 +54,33 @@ test("CLI errors carry the exit-code class", () => {
   assert.equal(silent.message, "Subscription fetch failed")
 })
 
-test("subscription detail shows quota, expiry, and staleness", () => {
-  const now = Date.parse("2026-08-18T12:00:00Z")
-  const detail = Model.subscriptionDetail({
+test("subscription usage shows quota and expiry", () => {
+  const usage = Model.subscriptionUsage({
     name: "home",
-    updatedAt: "2026-08-12T12:00:00Z",
     upload: 12000000000,
     download: 130000000000,
     total: 500000000000,
     expire: Date.parse("2027-03-12T00:00:00Z") / 1000
-  }, now)
-  assert.match(detail, /142 GB of 500 GB/)
-  assert.match(detail, /expires 12 Mar/)
-  assert.match(detail, /updated 6d ago/)
+  })
+  assert.equal(usage.fraction, 0.284)
+  assert.match(usage.text, /142 GB of 500 GB/)
+  assert.match(usage.text, /expires 12 Mar/)
 })
 
-test("a subscription with no userinfo shows only its staleness", () => {
-  const now = Date.parse("2026-08-18T12:00:00Z")
-  const detail = Model.subscriptionDetail({
-    name: "backup", updatedAt: "2026-08-18T09:00:00Z",
-    upload: null, download: null, total: null, expire: null
-  }, now)
-  assert.equal(detail, "updated 3h ago")
+test("a subscription with no userinfo has no quota bar", () => {
+  const usage = Model.subscriptionUsage({
+    name: "backup", upload: null, download: null, total: null, expire: null
+  })
+  assert.equal(usage.fraction, -1)
+  assert.equal(usage.text, "no quota reported")
 })
 
 test("rule validation mirrors the CLI's per-type rules", () => {
   assert.equal(Model.validateRule("IP-CIDR", "10.0.0.0/8", "DIRECT"), "")
   assert.equal(Model.validateRule("IP-CIDR", "fd00::/64", "DIRECT"), "")
   assert.notEqual(Model.validateRule("IP-CIDR", "example.com", "DIRECT"), "")
+  assert.notEqual(Model.validateRule("PROCESS-NAME", "Firefox,REJECT", "Proxy"), "")
+  assert.notEqual(Model.validateRule("IP-CIDR", "10.0.0.0/8", "DIRECT,no-resolve"), "")
   assert.notEqual(Model.validateRule("IP-CIDR", "10.0.0.0/33", "DIRECT"), "")
   assert.notEqual(Model.validateRule("IP-CIDR", "300.0.0.0/8", "DIRECT"), "")
   assert.equal(Model.validateRule("DOMAIN-SUFFIX", "example.com", "Proxy"), "")
@@ -143,6 +142,7 @@ test("our own rules are peeled off the head of the merged list", () => {
     rules: [
       { type: "DomainSuffix", payload: "internal.example", proxy: "DIRECT" },
       { type: "ProcessName", payload: "syncthing", proxy: "DIRECT" },
+      { type: "DomainSuffix", payload: "tailscale.com", proxy: "GLOBAL" },
       { type: "DomainKeyword", payload: "google", proxy: "Proxy" },
       { type: "Match", payload: "", proxy: "Proxy" }
     ]
@@ -151,10 +151,23 @@ test("our own rules are peeled off the head of the merged list", () => {
     { index: 1, kind: "prepend", rule: "DOMAIN-SUFFIX,internal.example,DIRECT" },
     { index: 2, kind: "prepend", rule: "PROCESS-NAME,syncthing,DIRECT" }
   ]))
-  const theirs = Model.stripOwnRules(merged, own)
-  assert.deepEqual(theirs.map(r => r.value), ["google", ""])
+  const split = Model.splitApiRules(merged, own, ["DOMAIN-SUFFIX,tailscale.com,GLOBAL"])
+  assert.deepEqual(split.injected.map(r => r.value), ["tailscale.com"])
+  assert.deepEqual(split.subscription.map(r => r.value), ["google", ""])
   assert.equal(merged[0].type, "DOMAIN-SUFFIX")
-  assert.equal(merged[3].type, "MATCH")
+  assert.equal(merged[4].type, "MATCH")
+})
+
+test("injected rules the runtime does not carry yet are not peeled", () => {
+  const merged = Model.parseApiRules(JSON.stringify({
+    rules: [
+      { type: "DomainKeyword", payload: "tailscale.com", proxy: "GLOBAL" },
+      { type: "Match", payload: "", proxy: "Proxy" }
+    ]
+  }))
+  const split = Model.splitApiRules(merged, [], ["DOMAIN-SUFFIX,tailscale.com,GLOBAL"])
+  assert.equal(split.injected.length, 0)
+  assert.equal(split.subscription.length, 2)
 })
 
 test("append and filter rules never strip a subscription rule", () => {
@@ -164,7 +177,17 @@ test("append and filter rules never strip a subscription rule", () => {
   const own = Model.parseRules(JSON.stringify([
     { index: 1, kind: "append", rule: "DOMAIN-KEYWORD,google,Proxy" }
   ]))
-  assert.equal(Model.stripOwnRules(merged, own).length, 1)
+  assert.equal(Model.splitApiRules(merged, own, []).subscription.length, 1)
+})
+
+test("rule targets list the built-ins, then groups, then every config once", () => {
+  const groups = [
+    { name: "Proxy", all: ["Auto", "🇩🇪 Berlin", "DIRECT"] },
+    { name: "Auto", all: ["🇩🇪 Berlin", "🇯🇵 Tokyo", "constructor", "DIRECT,no-resolve"] }
+  ]
+  assert.deepEqual(Model.ruleTargets(groups).map(t => t.value + ":" + t.description),
+    ["DIRECT:built-in", "REJECT:built-in", "Proxy:group", "Auto:group", "🇩🇪 Berlin:config", "🇯🇵 Tokyo:config",
+      "constructor:config"])
 })
 
 test("mihomo rule types render as config syntax", () => {
@@ -195,6 +218,45 @@ const conn = (id, host, process, over) => Object.assign({
   chains: ["Tokyo 01", "Proxy"], rule: "DomainSuffix", rulePayload: "example.org",
   metadata: { network: "tcp", host, destinationPort: "443", processPath: process }
 }, over || {})
+
+test("connection labels use the API name and identify internal traffic", () => {
+  const items = Model.parseConnections(snapshot([
+    { id: "named", metadata: { process: "firefox", type: "Tun" } },
+    { id: "internal", metadata: { type: "Inner" } }
+  ])).items
+  assert.equal(items[0].process, "firefox")
+  assert.equal(items[1].process, "mihomo")
+})
+
+test("socket lookup identifies only unambiguous local connections", () => {
+  const item = Model.parseConnections(snapshot([{
+    id: "udp", metadata: { type: "Tun", network: "udp", sourceIP: "192.168.42.10",
+      sourcePort: "53000", destinationIP: "203.0.113.5", destinationPort: "443" }
+  }])).items[0]
+  const socket = { network: "udp", localIP: "0.0.0.0", localPort: 53000,
+    peerIP: "0.0.0.0", peerPort: 0, process: "firefox" }
+  const table = { addresses: ["192.168.42.10"], sockets: [socket] }
+  assert.equal(Model.enrichConnections([item], table)[0].process, "firefox")
+  assert.equal(Model.enrichConnections([item], { addresses: [], sockets: [socket] })[0].process, "")
+  assert.equal(Model.enrichConnections([item], { addresses: table.addresses,
+    sockets: [socket, {...socket, process: "another-app"}] })[0].process, "")
+  assert.equal(Model.enrichConnections([item], { addresses: table.addresses,
+    sockets: [{...socket, network: "tcp"}] })[0].process, "")
+  assert.equal(Model.enrichConnections([item], { addresses: table.addresses,
+    sockets: [{...socket, peerPort: 443, peerIP: "203.0.113.6"}] })[0].process, "")
+  assert.equal(Model.enrichConnections([{...item, process: "known"}], table)[0].process, "known")
+})
+
+test("a connection keeps its resolved owner when the socket disappears", () => {
+  const raw = snapshot([{id: "udp", metadata: {type: "Tun", network: "udp",
+    sourceIP: "192.168.42.10", sourcePort: "53000", destinationIP: "203.0.113.5", destinationPort: "443"}}])
+  const first = Model.parseConnections(raw).items
+  first[0].process = "firefox"
+  assert.equal(Model.mergeConnectionLog(first, Model.parseConnections(raw).items)[0].process, "firefox")
+  const changed = Model.parseConnections(raw).items
+  changed[0].sourcePort = 53001
+  assert.equal(Model.mergeConnectionLog(first, changed)[0].process, "")
+})
 
 test("a connection snapshot carries a host, a start, and its totals", () => {
   const now = Date.parse("2026-08-18T12:00:00Z")
@@ -301,16 +363,85 @@ test("systemd's ActiveEnterTimestamp parses as local time", () => {
   assert.equal(Model.parseUnitTimestamp("n/a"), 0)
 })
 
-test("config parameters stay inside what mihomo actually states", () => {
-  const parameters = Model.configParameters({
-    name: "Tokyo 01", type: "Vmess", udp: true, xudp: false, tfo: false,
-    alive: true, history: [{ delay: 182 }],
-    server: "should-never-render", port: 443
-  })
-  const labels = parameters.map(p => p.label)
-  assert.deepEqual(labels, ["Type", "UDP", "Alive", "Latency"])
-  assert.equal(parameters[3].value, "182 ms")
-  assert.deepEqual(Model.configParameters(null), [])
+test("the rule tester stops at the first hit, mihomo's order", () => {
+  const rules = [
+    { type: "DOMAIN-SUFFIX", value: "github.com", target: "Proxy" },
+    { type: "RULE-SET", value: "streaming", target: "Streaming" },
+    { type: "DOMAIN-SUFFIX", value: "googlevideo.com", target: "Streaming" },
+    { type: "GEOIP", value: "private", target: "DIRECT" },
+    { type: "MATCH", value: "", target: "Proxy" }
+  ]
+  const video = Model.testRules(rules, "https://rr3.googlevideo.com:443/videoplayback?x=1")
+  assert.equal(video.host, "rr3.googlevideo.com")
+  assert.equal(video.hit, 2)
+  assert.deepEqual(video.verdicts, ["miss", "unknown", "hit"])
+  assert.equal(video.unknown, 1)
+
+  assert.equal(Model.testRules(rules, "10.2.3.4").hit, 3)
+  assert.equal(Model.testRules(rules, "example.org").hit, 4)
+  assert.equal(Model.testRules(rules, "notgithub.com").verdicts[0], "miss")
+  assert.equal(Model.testRules(rules, "  ").hit, -1)
+})
+
+test("IP rules on a hostname depend on the core's DNS answer", () => {
+  assert.equal(Model.ruleVerdict({ type: "IP-CIDR", value: "10.0.0.0/8" }, "example.org"), "unknown")
+  assert.equal(Model.ruleVerdict({ type: "IP-CIDR", value: "10.0.0.0/8" }, "10.9.9.9"), "hit")
+  assert.equal(Model.ruleVerdict({ type: "IP-CIDR", value: "192.168.0.0/16" }, "192.169.0.1"), "miss")
+  assert.equal(Model.ruleVerdict({ type: "DOMAIN-KEYWORD", value: "openai" }, "chat.openai.com"), "hit")
+  assert.equal(Model.ruleVerdict({ type: "PROCESS-NAME", value: "steam" }, "steampowered.com"), "unknown")
+})
+
+test("rule testing accounts for the active TUN route exclusions", () => {
+  const rules = [{ type: "MATCH", target: "Proxy" }]
+  const routing = { tunEnabled: true, tunAutoRoute: true, routeExcludeAddresses: ["192.168.0.0/16"] }
+  const result = Model.testRules(rules, "192.168.42.1", routing)
+  assert.equal(result.bypassed, true)
+  assert.equal(result.bypassCidr, "192.168.0.0/16")
+  assert.equal(result.hit, -1)
+  assert.equal(Model.testRules(rules, "203.0.113.5", routing).bypassed, false)
+  assert.equal(Model.testRules(rules, "192.168.42.1", {...routing, tunEnabled: false}).hit, 0)
+  assert.equal(Model.testRules(rules, "192.168.42.1", {...routing, tunAutoRoute: false}).hit, 0)
+  assert.equal(Model.testRules(rules, "192.168.42.1", {...routing, routeExcludeAddresses: []}).hit, 0)
+  const parsed = Model.parseConfigs(JSON.stringify({tun: {enable: true, "auto-route": true,
+    "route-exclude-address": ["192.168.0.0/16"]}}))
+  assert.deepEqual(parsed.routing, routing)
+})
+
+test("a later rule hit is tentative when an earlier rule is unresolved", () => {
+  assert.equal(Model.testRules([{type: "RULE-SET", value: "private", target: "DIRECT"},
+    {type: "MATCH", target: "Proxy"}], "192.168.42.1").certain, false)
+  assert.equal(Model.testRules([{type: "MATCH", target: "Proxy"}], "203.0.113.5").certain, true)
+})
+
+test("targets tally largest first", () => {
+  const tally = Model.ruleTargetTally([
+    { target: "DIRECT" }, { target: "Proxy" }, { target: "DIRECT" }, { target: "" }
+  ])
+  assert.deepEqual(tally, [{ target: "DIRECT", count: 2 }, { target: "Proxy", count: 1 }])
+})
+
+test("remote names that shadow object prototypes stay plain data", () => {
+  const parsed = Model.parseProxies('{"proxies":{"__proto__":{"type":"Vless"}}}')
+  assert.deepEqual(Object.keys(parsed.configs), ["__proto__"])
+  assert.deepEqual(Model.ruleTargetTally([{ target: "constructor" }]), [{ target: "constructor", count: 1 }])
+  const flows = Model.connectionFlows([{ process: "constructor", chain: "DIRECT", download: 5, upload: 0, open: true }], 4, 4)
+  assert.deepEqual(flows.sources, [{ name: "constructor", bytes: 5 }])
+})
+
+test("connection flows fold the smallest nodes into other", () => {
+  const stack = (process, chain, bytes, open) => ({ process, chain, download: bytes, upload: 0, open })
+  const flows = Model.connectionFlows([
+    stack("firefox", "London 05", 500, true),
+    stack("firefox", "Frankfurt 04", 300, true),
+    stack("steam", "DIRECT", 900, true),
+    stack("git", "Frankfurt 04", 50, true),
+    stack("code", "Frankfurt 04", 999999, false)
+  ], 2, 3)
+  assert.deepEqual(flows.sources.map(n => n.name), ["steam", "other"])
+  assert.equal(flows.sources[1].bytes, 850)
+  assert.deepEqual(flows.targets.map(n => n.name), ["DIRECT", "London 05", "Frankfurt 04"])
+  assert.deepEqual(flows.links[0], { source: "steam", target: "DIRECT", bytes: 900 })
+  assert.equal(flows.links.reduce((sum, link) => sum + link.bytes, 0), 1750)
 })
 
 test("formatting is decimal and compact", () => {
@@ -326,6 +457,16 @@ test("formatting is decimal and compact", () => {
   assert.equal(Model.formatDelay(182), "182 ms")
 })
 
+test("latency heat runs from the fastest measured delay to the slowest", () => {
+  const span = Model.delaySpan([0, 206, 689, 330, 0])
+  assert.deepEqual(span, { low: 206, high: 689 })
+  assert.equal(Model.delayHeat(206, span), 0)
+  assert.equal(Model.delayHeat(689, span), 1)
+  assert.ok(Math.abs(Model.delayHeat(447.5, span) - 0.5) < 1e-9)
+  assert.equal(Model.delayHeat(0, span), 0)
+  assert.equal(Model.delayHeat(300, Model.delaySpan([300])), 0)
+})
+
 test("the config filter matches case-insensitively anywhere in the name", () => {
   const names = ["Tokyo 01", "TOKYO 02", "Frankfurt 01"]
   assert.deepEqual(Model.filterNames(names, "tokyo"), ["Tokyo 01", "TOKYO 02"])
@@ -339,4 +480,12 @@ test("mode cycles through mihomo's three modes", () => {
   assert.equal(Model.nextMode("direct"), "rule")
   // An unknown mode lands on the first, rather than skipping past it.
   assert.equal(Model.nextMode(""), "rule")
+})
+
+test("a leading flag or emoji splits off a name with its space", () => {
+  assert.deepEqual(Model.leadingEmoji("🇩🇪 Германия #1-3 🚀"), { mark: "🇩🇪", rest: "Германия #1-3 🚀" })
+  assert.deepEqual(Model.leadingEmoji("🚀  Fast"), { mark: "🚀", rest: "Fast" })
+  assert.deepEqual(Model.leadingEmoji("☁️ Cloud"), { mark: "☁️", rest: "Cloud" })
+  assert.deepEqual(Model.leadingEmoji("🇩🇪Германия"), { mark: "", rest: "🇩🇪Германия" })
+  assert.deepEqual(Model.leadingEmoji("DIRECT"), { mark: "", rest: "DIRECT" })
 })

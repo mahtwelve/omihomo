@@ -13,7 +13,7 @@ Subscriptions, groups, latency, rules, TUN, and live connections, one keypress a
 [![Bar widget](https://img.shields.io/badge/plugin-bar%20widget-bb9af7)](manifest.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-9ece6a)](LICENSE)
 
-![Omihomo's main panel, connections log, and rules editor open over the Omarchy desktop](preview.png)
+![Omihomo's configs, connections, and rules views open over the Omarchy desktop](preview.png)
 
 </div>
 
@@ -21,25 +21,25 @@ Subscriptions, groups, latency, rules, TUN, and live connections, one keypress a
 
 - **One-click core.** Start, stop, and install mihomo from the bar. The icon dims when the core is off.
 - **Subscriptions.** Paste a URL, and Omihomo imports it, names it, and refreshes it on the provider's schedule.
-- **Groups and configs.** Pick a config, latency-test one or a whole group, and choose the primary group.
-- **Live readout.** Throughput, uptime, and the egress IP with its round trip through the selected config.
-- **Connections log.** Open and recently closed connections, grouped by process and destination. Close one stack or all of them.
-- **Your rules first.** Add `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, and `PROCESS-NAME` rules that apply before the subscription's own rules.
+- **Groups and configs.** Pick a config, latency-test one or a whole group, and choose the primary group. Latency is colour-coded.
+- **Live readout.** A traffic graph, uptime, and the egress IP with its round trip through the selected config.
+- **Connections log.** Traffic drawn as process → config flows, and open and recently closed connections grouped by process and destination. Close one stack or all of them.
+- **Your rules first.** Add `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, and `PROCESS-NAME` rules that apply before the subscription's own rules, and test a domain or IP to see which rule catches it.
 - **TUN, mode, Tailscale.** Toggle TUN, cycle rule, global, and direct mode, and route the tailnet through the proxy.
-- **Keyboard first.** `j`/`k` walk the whole panel, and every action has a single-letter key.
+- **Keyboard first.** `1`–`4` switch views, `j`/`k` walk the view, and every action has a single-letter key.
 - **Scriptable.** Everything the panel does is also an `omihomo` CLI verb.
 
 ## Screenshots
 
 <table>
   <tr>
-    <td align="center" width="33%"><img src="assets/screenshots/main.png" alt="Main panel with status, configs, and groups"><br><sub>Status, configs, and groups</sub></td>
+    <td align="center" width="33%"><img src="assets/screenshots/configs.png" alt="Configs view with the traffic graph, groups, and latency"><br><sub>Traffic, groups, and latency</sub></td>
     <td align="center" width="33%"><img src="assets/screenshots/subscriptions.png" alt="Subscriptions with quota and expiry"><br><sub>Subscriptions with quota and expiry</sub></td>
-    <td align="center" width="33%"><img src="assets/screenshots/connections.png" alt="Connections log with open and closed stacks"><br><sub>Connections log</sub></td>
+    <td align="center" width="33%"><img src="assets/screenshots/connections.png" alt="Connections view with process-to-config flows and the log"><br><sub>Flows and the connections log</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="assets/screenshots/rules.png" alt="Rules view adding a rule"><br><sub>Your rules and the subscription's</sub></td>
-    <td align="center"><img src="assets/screenshots/manage.png" alt="Manage view with autostart, Tailscale, and acceleration"><br><sub>Autostart, Tailscale, and TUN acceleration</sub></td>
+    <td align="center"><img src="assets/screenshots/rules.png" alt="Rules view testing a hostname against the rules"><br><sub>Rule tester and your rules</sub></td>
+    <td align="center"><img src="assets/screenshots/settings.png" alt="Settings with mode, TUN, autostart, and Tailscale"><br><sub>Mode, TUN, autostart, and Tailscale</sub></td>
     <td></td>
   </tr>
 </table>
@@ -71,12 +71,12 @@ opens a floating terminal for the AUR build, or run `omihomo core install` yours
 | Left click | Open the panel |
 | Right click | Start or stop the core |
 | Middle click | Refresh |
+| `1` – `4`, `M` | Configs, Subs, Rules, Conns, settings |
 | `j` / `k`, `enter` | Move, activate |
 | `s` / `t` / `m` | Core on/off, TUN, mode |
 | `a` / `n` | Add subscription, new rule |
 | `d` / `D` | Latency test a config, a whole group |
-| `c` / `M` | Connections view, manage view |
-| `/` | Filter configs |
+| `/` | Filter configs, test a rule |
 
 The full key map is in [docs/widget.md](docs/widget.md#keys), and every CLI verb is in
 [docs/cli.md](docs/cli.md).
@@ -102,6 +102,11 @@ Checks run every minute, even with the panel closed or the core stopped. A refre
 running or stopped state, mode, and TUN state, and the selected configs that still exist in their
 groups. A failed download keeps the previous configuration and retries on the next check.
 
+Autostart is enabled by default on new installs. When enabled, every core start also refreshes
+all subscriptions, even before their scheduled deadlines. This runs separately after the core
+starts, so an unavailable provider leaves the cached configuration running. Existing installs
+keep their autostart setting, including an explicit choice to disable it.
+
 Each successful import or update records the interval and its timestamp, so a provider can change
 the interval in any response. A failed update keeps both previous values. Every download and
 controller call has its own timeout. The batch as a whole has none, so a slow subscription cannot
@@ -122,7 +127,7 @@ systemctl --user enable --now omihomo-subscription-update.timer
 
 <br>
 
-A subscription without an inbound gets `mixed-port: 7890`. Omihomo sets DNS to `redir-host` mode,
+The core listens on `mixed-port: 7890` on loopback; a subscription cannot open ports or listeners. Omihomo sets DNS to `redir-host` mode,
 with Cloudflare DNS-over-HTTPS through the primary proxy group. Proxy-server and DNS-server
 hostnames resolve through direct Cloudflare DoH, so connecting to the proxy never depends on the
 proxy itself. Resolver settings and DNS modes you set in `override.yaml` take precedence.
@@ -141,6 +146,7 @@ A proxy manager needs more than a config file. This is everything Omihomo change
 | pacman hook that reapplies both after a mihomo upgrade | `/usr/share/libalpm/hooks/omihomo-permissions.hook` | `core install`, `core repair` |
 | systemd user unit for the core | `~/.config/systemd/user/omihomo.service` | `core install` |
 | subscription refresh service and timer | `~/.config/systemd/user/omihomo-subscription-update.{service,timer}` | `core install`, first `core sync` after upgrade |
+| subscription startup refresh service | `~/.config/systemd/user/omihomo-subscription-startup.service` | core unit creation, first `core sync` after upgrade |
 | CLI symlink | `~/.local/bin/omihomo` | `core install` |
 | subscriptions, configs, rules, cache | `~/.local/share/omihomo/` | every write verb |
 | proxy env for tailscaled | `/etc/systemd/system/tailscaled.service.d/omihomo.conf` | `set tailscale on` only |
@@ -149,9 +155,10 @@ All root work lives in one file, [libexec/root.sh](libexec/root.sh), which accep
 actions. It runs through `sudo` from a terminal and `pkexec` from the panel, and Omihomo installs no
 sudoers policy. mihomo runs setuid root because TUN needs it
 ([ADR-0006](docs/adr/0006-tun-via-setuid-root.md)), and only the account that installed Omihomo may
-execute it, so other local accounts cannot run it as root. A subscription's controller, NTP and download
-path settings are dropped, so it cannot control the core, overwrite Omihomo's state or set the
-clock. Omihomo used file capabilities before
+execute it, so other local accounts cannot run it as root. A subscription contributes only proxies, groups,
+rules, providers and resolver settings, fetched over HTTPS and validated by an unprivileged copy of
+the core, so it cannot control the core, open listeners, change host networking, overwrite
+Omihomo's state or set the clock. Omihomo used file capabilities before
 ([ADR-0002](docs/adr/0002-tun-via-file-capabilities.md)), and granting permissions still clears
 them.
 

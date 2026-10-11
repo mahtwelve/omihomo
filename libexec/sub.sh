@@ -11,9 +11,10 @@ subscription_exists() {
 }
 
 # The URL is what the user actually chose, so it is what "already added" means.
+# URLs often carry an access token, so they reach child processes through the
+# environment or stdin, never their arguments, which every account can read.
 subscription_url_exists() {
-  local url=$1
-  jq -e --arg url "$url" 'any(.[]; .url == $url)' "$OMIHOMO_SUBSCRIPTIONS_FILE" >/dev/null
+  OMIHOMO_URL=$1 jq -e 'any(.[]; .url == $ENV.OMIHOMO_URL)' "$OMIHOMO_SUBSCRIPTIONS_FILE" >/dev/null
 }
 
 subscription_userinfo_json() {
@@ -32,10 +33,16 @@ subscription_userinfo_json() {
 # with `content-encoding: gzip` whether or not the client asked for it, and
 # without this curl writes the compressed bytes out verbatim, so every step
 # downstream sees binary instead of a subscription.
+#
+# The URL goes in through curl's config on stdin. HTTPS is required for the
+# request and every redirect, and the file size limit bounds the decoded body.
 fetch_subscription() {
   local url=$1 body=$2 headers=$3
-  if ! "$OMIHOMO_CURL" -fsSL --compressed --connect-timeout 10 --max-time 60 \
-    -A "$OMIHOMO_USER_AGENT" -D "$headers" -o "$body" "$url"; then
+  url=${url//\\/\\\\}
+  if ! (ulimit -f "$OMIHOMO_MAX_FILE_KB" &&
+    "$OMIHOMO_CURL" -fsSL --compressed --proto =https --proto-redir =https \
+      --connect-timeout 10 --max-time 60 --max-filesize "${OMIHOMO_MAX_FILE_KB}K" \
+      -A "$OMIHOMO_USER_AGENT" -D "$headers" -o "$body" --config - <<<"url = \"${url//\"/\\\"}\""); then
     omi_error "subscription fetch failed" 21
   fi
 }
@@ -106,8 +113,12 @@ preflight_raw_provider() {
     return 20
   fi
 
-  binary=$(omi_mihomo_bin)
-  "$binary" -d "$directory" -f "$config" >"$log" 2>&1 &
+  binary=$(omi_unprivileged_core "$directory") || {
+    rm -rf -- "$directory"
+    omi_error "failed to prepare raw subscription validation" 20
+    return 20
+  }
+  (ulimit -f "$OMIHOMO_MAX_FILE_KB" && exec "$binary" -d "$directory" -f "$config") >"$log" 2>&1 &
   pid=$!
   for attempt in {1..40}; do
     if "$OMIHOMO_CURL" -fsS --max-time 1 --unix-socket "$socket" \
@@ -161,8 +172,19 @@ prepare_subscription_cache() {
   local url=$1 body=$2 prepared status digest
   PREPARED_PROVIDER=
   if [[ $(classify_subscription_body "$body") == full ]]; then
-    omi_validate_yaml "$body" || return $?
-    PREPARED_BODY=$body
+    prepared=$(mktemp "${OMIHOMO_DATA_DIR}/.subscription.XXXXXX")
+    if ! omi_sanitize_subscription "$body" "$prepared"; then
+      rm -f "$prepared"
+      omi_error "failed to prepare the subscription" 20
+      return 20
+    fi
+    omi_validate_yaml "$prepared" || {
+      status=$?
+      rm -f "$prepared"
+      return "$status"
+    }
+    rm -f "$body"
+    PREPARED_BODY=$prepared
     return 0
   fi
 
@@ -246,7 +268,8 @@ subscription_fetched_name() {
   title=$(sanitize_name "$title")
   if [[ -z $title ]]; then
     title=${url#*://}
-    title=$(sanitize_name "${title%%/*}")
+    title=${title%%[/?#]*}
+    title=$(sanitize_name "${title##*@}")
   fi
   printf '%s\n' "${title:-subscription}"
 }
@@ -279,21 +302,23 @@ fetch_validated_subscription() {
   FETCH_HEADERS=$headers
 }
 
+# The URL arrives on stdin, so its token never shows up in a process list.
 subscription_add() {
-  local url=${1:-}
+  local url
+  IFS= read -r url || [[ -n $url ]] || omi_error "pass the subscription URL on stdin" 1
   omi_init_layout
-  [[ $url =~ ^https?:// ]] || omi_error "subscription URL must use http or https" 1
+  [[ $url =~ ^https://[^[:space:][:cntrl:]]+$ ]] || omi_error "subscription URL must use https" 1
   subscription_url_exists "$url" && omi_error "subscription already exists for this URL" 1
-  local name body headers record temporary
+  local name body headers temporary
   fetch_validated_subscription "$url" || return $?
   body=$FETCH_BODY
   headers=$FETCH_HEADERS
   name=$(unique_name "$(subscription_fetched_name "$headers" "$url")")
-  record=$(jq -cn --arg name "$name" --arg url "$url" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson interval "$(subscription_update_interval_hours "$headers")" --argjson userinfo "$(subscription_userinfo_json "$headers")" \
-    '{name: $name, url: $url, updated_at: $updated, update_interval_hours: $interval, userinfo: $userinfo}')
   temporary=$(mktemp "${OMIHOMO_DATA_DIR}/.subscriptions.XXXXXX")
-  jq --argjson record "$record" '. + [$record]' "$OMIHOMO_SUBSCRIPTIONS_FILE" >"$temporary"
+  OMIHOMO_URL=$url jq --arg name "$name" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson interval "$(subscription_update_interval_hours "$headers")" --argjson userinfo "$(subscription_userinfo_json "$headers")" \
+    '. + [{name: $name, url: $ENV.OMIHOMO_URL, updated_at: $updated, update_interval_hours: $interval, userinfo: $userinfo}]' \
+    "$OMIHOMO_SUBSCRIPTIONS_FILE" >"$temporary"
   omi_atomic_move "$body" "$OMIHOMO_CACHE_DIR/${name}.yaml"
   omi_atomic_move "$temporary" "$OMIHOMO_SUBSCRIPTIONS_FILE"
   rm -f "$headers"
@@ -433,17 +458,31 @@ subscription_update_if_due() {
   subscription_update "$name"
 }
 
-subscription_update_due() {
+subscription_update_batch() {
   [[ -f $OMIHOMO_SUBSCRIPTIONS_FILE ]] && omi_core_installed || return 0
-  local names name status=0
+  local command=${1:-update-if-due} names name status=0
   names=$(jq -r '.[].name' "$OMIHOMO_SUBSCRIPTIONS_FILE")
   while IFS= read -r name; do
     [[ -n $name ]] || continue
-    # A separate process keeps errexit effective inside subscription_update
-    # while allowing one failing subscription to leave the others runnable.
-    "$OMIHOMO_ROOT/libexec/sub.sh" update-if-due "$name" || status=1
+    "$OMIHOMO_ROOT/libexec/sub.sh" "$command" "$name" || status=1
   done <<<"$names"
   return "$status"
+}
+
+# A core can take minutes to come up while it downloads geodata. Exit 12 tells
+# the startup unit to try again later; a failed download does not.
+subscription_update_on_start() {
+  [[ -s $OMIHOMO_SUBSCRIPTIONS_FILE ]] && omi_core_installed &&
+    omi_unit_enabled && omi_unit_active || return 0
+  local deadline=$((SECONDS + ${OMIHOMO_STARTUP_READY_TIMEOUT:-120}))
+  while ((SECONDS < deadline)); do
+    if omi_api_reachable; then
+      subscription_update_batch update
+      return $?
+    fi
+    sleep 1
+  done
+  omi_error "core controller was not ready for the startup subscription refresh" 12
 }
 
 subscription_remove() {
@@ -499,11 +538,12 @@ subscription_activate() {
 }
 
 case ${1:-} in
-  add) omi_with_lock subscription_add "${2:-}" ;;
+  add) omi_with_lock subscription_add ;;
   list) subscription_list ;;
   remove) omi_with_lock subscription_remove "${2:-}" ;;
   update) omi_with_lock subscription_update "${2:-}" ;;
-  update-due) subscription_update_due ;;
+  update-due) subscription_update_batch ;;
+  update-on-start) subscription_update_on_start ;;
   update-if-due) omi_with_lock subscription_update_if_due "${2:-}" ;;
   activate) omi_with_lock subscription_activate "${2:-}" ;;
   *) omi_error "unknown subscription command" 1 ;;
