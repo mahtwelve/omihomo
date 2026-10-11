@@ -17,27 +17,61 @@ import (
 	"github.com/readeem/omihomo/internal/protocol"
 )
 
-// Options configures a Daemon. Core is required; the rest have defaults.
-type Options struct {
-	Core core.Core
-	// OwnerFile records the one uid the socket serves; see package owner.
-	// It is read on every connection, so claiming ownership needs no restart.
-	OwnerFile string
-	Version   string
-	Logger    *slog.Logger
-	// Tick is how often the traffic and connections streams push.
-	Tick time.Duration
-	// EgressURL answers with a Cloudflare-style trace: "ip=<addr>" lines.
-	EgressURL string
-	// TailscalePresent reports whether tailscaled is installed.
-	TailscalePresent func() bool
-	MaxClients       int
+// Daemon serves the protocol on its listeners until ctx is done, then
+// disconnects every client and stops the core. Run closes the listeners.
+type Daemon interface {
+	Run(ctx context.Context, listeners ...net.Listener) error
+}
+
+// ConfigOpt changes one optional setting of New. A zero value, such as a
+// nil logger or a non-positive count, keeps the default.
+type ConfigOpt func(*config)
+
+type config struct {
+	ownerFile        string
+	version          string
+	log              *slog.Logger
+	tick             time.Duration
+	egressURL        string
+	tailscalePresent func() bool
+	maxClients       int
+}
+
+// WithOwnerFile reads the owner from path instead of owner.DefaultPath. The
+// file is read on every connection, so claiming ownership needs no restart.
+func WithOwnerFile(path string) ConfigOpt {
+	return func(c *config) { set(&c.ownerFile, path, path != "") }
+}
+
+// WithVersion is the version the greeting reports.
+func WithVersion(v string) ConfigOpt { return func(c *config) { set(&c.version, v, v != "") } }
+
+func WithLogger(l *slog.Logger) ConfigOpt { return func(c *config) { set(&c.log, l, l != nil) } }
+
+// WithTick is how often the traffic and connections streams push.
+func WithTick(d time.Duration) ConfigOpt { return func(c *config) { set(&c.tick, d, d > 0) } }
+
+// WithEgressURL is fetched by egress.check. It must answer with a
+// Cloudflare-style trace: "ip=<addr>" lines.
+func WithEgressURL(url string) ConfigOpt {
+	return func(c *config) { set(&c.egressURL, url, url != "") }
+}
+
+// WithTailscaleProbe reports whether tailscaled is installed.
+func WithTailscaleProbe(present func() bool) ConfigOpt {
+	return func(c *config) { set(&c.tailscalePresent, present, present != nil) }
+}
+
+// WithMaxClients bounds how many clients are served at once.
+func WithMaxClients(n int) ConfigOpt { return func(c *config) { set(&c.maxClients, n, n > 0) } }
+
+func set[T any](field *T, v T, ok bool) {
+	if ok {
+		*field = v
+	}
 }
 
 const (
-	defaultTick       = time.Second
-	defaultEgressURL  = "https://cloudflare.com/cdn-cgi/trace"
-	defaultMaxClients = 16
 	// Calls one client may have in flight at once.
 	maxInFlight = 8
 	// Messages queued for one client before it counts as stuck.
@@ -46,12 +80,11 @@ const (
 	callTimeout  = 2 * time.Minute
 )
 
-// Daemon is the server. Create one with New and start it with Run.
-type Daemon struct {
-	opts Options
+type server struct {
+	core core.Core
+	cfg  config
 	log  *slog.Logger
 
-	// clients tracks every accepted connection until it is gone.
 	clients sync.WaitGroup
 
 	// opMu serializes the calls that change what the core runs.
@@ -70,32 +103,29 @@ type Daemon struct {
 	lastPushed map[string][]byte
 }
 
-// New returns a daemon with the proxy stopped.
-func New(opts Options) *Daemon {
-	if opts.Logger == nil {
-		opts.Logger = slog.Default()
-	}
-	if opts.Tick <= 0 {
-		opts.Tick = defaultTick
-	}
-	if opts.EgressURL == "" {
-		opts.EgressURL = defaultEgressURL
-	}
-	if opts.TailscalePresent == nil {
-		opts.TailscalePresent = func() bool {
+var _ Daemon = (*server)(nil)
+
+// New returns a daemon driving c, with the proxy stopped.
+func New(c core.Core, opts ...ConfigOpt) Daemon {
+	cfg := config{
+		ownerFile: owner.DefaultPath,
+		version:   "dev",
+		log:       slog.Default(),
+		tick:      time.Second,
+		egressURL: "https://cloudflare.com/cdn-cgi/trace",
+		tailscalePresent: func() bool {
 			_, err := exec.LookPath("tailscaled")
 			return err == nil
-		}
+		},
+		maxClients: 16,
 	}
-	if opts.MaxClients <= 0 {
-		opts.MaxClients = defaultMaxClients
+	for _, opt := range opts {
+		opt(&cfg)
 	}
-	if opts.Version == "" {
-		opts.Version = "dev"
-	}
-	return &Daemon{
-		opts:       opts,
-		log:        opts.Logger,
+	return &server{
+		core:       c,
+		cfg:        cfg,
+		log:        cfg.log,
 		state:      protocol.StateStopped,
 		settings:   defaultSettings(),
 		sessions:   map[*session]struct{}{},
@@ -103,9 +133,7 @@ func New(opts Options) *Daemon {
 	}
 }
 
-// Run serves listeners until ctx is done, then disconnects every client and
-// stops the core. It closes the listeners.
-func (d *Daemon) Run(ctx context.Context, listeners ...net.Listener) error {
+func (d *server) Run(ctx context.Context, listeners ...net.Listener) error {
 	if len(listeners) == 0 {
 		return errors.New("no socket to serve")
 	}
@@ -133,7 +161,7 @@ func (d *Daemon) Run(ctx context.Context, listeners ...net.Listener) error {
 
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stopCancel()
-	if err := d.opts.Core.Stop(stopCtx); err != nil {
+	if err := d.core.Stop(stopCtx); err != nil {
 		d.log.Error("stop the core on shutdown", "err", err)
 	}
 	select {
@@ -144,7 +172,7 @@ func (d *Daemon) Run(ctx context.Context, listeners ...net.Listener) error {
 	}
 }
 
-func (d *Daemon) accept(ctx context.Context, l net.Listener) error {
+func (d *server) accept(ctx context.Context, l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -161,8 +189,7 @@ func (d *Daemon) accept(ctx context.Context, l net.Listener) error {
 	}
 }
 
-// admit greets an owner and refuses anyone else.
-func (d *Daemon) admit(ctx context.Context, conn net.Conn) {
+func (d *server) admit(ctx context.Context, conn net.Conn) {
 	refuse := func(code, message string) {
 		conn.SetWriteDeadline(time.Now().Add(time.Second))
 		if b, err := protocol.Line(protocol.Refused{Type: protocol.TypeRefused,
@@ -183,7 +210,7 @@ func (d *Daemon) admit(ctx context.Context, conn net.Conn) {
 		refuse(protocol.CodeForbidden, "could not identify the connecting account")
 		return
 	}
-	ownerUID, err := owner.Load(d.opts.OwnerFile)
+	ownerUID, err := owner.Load(d.cfg.ownerFile)
 	if err != nil {
 		d.log.Warn("refused a client: no usable owner", "uid", uid, "err", err)
 		if errors.Is(err, owner.ErrUnclaimed) {
@@ -201,7 +228,7 @@ func (d *Daemon) admit(ctx context.Context, conn net.Conn) {
 
 	s := newSession(d, conn)
 	d.mu.Lock()
-	full := len(d.sessions) >= d.opts.MaxClients
+	full := len(d.sessions) >= d.cfg.maxClients
 	if !full {
 		d.sessions[s] = struct{}{}
 	}
@@ -210,7 +237,7 @@ func (d *Daemon) admit(ctx context.Context, conn net.Conn) {
 		refuse(protocol.CodeBusy, "too many clients")
 		return
 	}
-	s.send(protocol.Hello{Type: protocol.TypeHello, Protocol: protocol.Version, Version: d.opts.Version})
+	s.send(protocol.Hello{Type: protocol.TypeHello, Protocol: protocol.Version, Version: d.cfg.version})
 	s.serve(ctx)
 
 	d.mu.Lock()
@@ -218,9 +245,8 @@ func (d *Daemon) admit(ctx context.Context, conn net.Conn) {
 	d.mu.Unlock()
 }
 
-// tick pushes the periodic streams while anyone is listening.
-func (d *Daemon) tick(ctx context.Context) {
-	t := time.NewTicker(d.opts.Tick)
+func (d *server) tick(ctx context.Context) {
+	t := time.NewTicker(d.cfg.tick)
 	defer t.Stop()
 	for {
 		select {
@@ -232,25 +258,25 @@ func (d *Daemon) tick(ctx context.Context) {
 			continue
 		}
 		if d.listening(protocol.StreamTraffic) {
-			if v, err := d.opts.Core.Traffic(ctx); err == nil {
+			if v, err := d.core.Traffic(ctx); err == nil {
 				d.broadcast(protocol.StreamTraffic, v)
 			}
 		}
 		if d.listening(protocol.StreamConnections) {
-			if v, err := d.opts.Core.Connections(ctx); err == nil {
+			if v, err := d.core.Connections(ctx); err == nil {
 				d.broadcast(protocol.StreamConnections, v)
 			}
 		}
 	}
 }
 
-func (d *Daemon) running() bool {
+func (d *server) running() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.state == protocol.StateOn || d.state == protocol.StateDegraded
 }
 
-func (d *Daemon) listening(stream string) bool {
+func (d *server) listening(stream string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for s := range d.sessions {
@@ -261,7 +287,7 @@ func (d *Daemon) listening(stream string) bool {
 	return false
 }
 
-func (d *Daemon) subscribers(stream string) []*session {
+func (d *server) subscribers(stream string) []*session {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var out []*session
@@ -273,14 +299,25 @@ func (d *Daemon) subscribers(stream string) []*session {
 	return out
 }
 
-// broadcast pushes v on stream to every subscriber.
-func (d *Daemon) broadcast(stream string, v any) {
-	b, err := protocol.Line(protocol.Event{Type: protocol.TypeEvent, Stream: stream, Data: v})
-	if err != nil {
-		d.log.Error("encode event", "stream", stream, "err", err)
-		return
-	}
+func (d *server) broadcast(stream string, v any) {
+	b := d.eventLine(stream, v)
 	for _, s := range d.subscribers(stream) {
 		s.sendLine(b)
 	}
+}
+
+// eventLine encodes a push. A value too large to send is pushed as an error
+// instead, so subscribers know their copy is stale rather than missing it.
+func (d *server) eventLine(stream string, data any) []byte {
+	b, err := protocol.Line(protocol.Event{Type: protocol.TypeEvent, Stream: stream, Data: data})
+	if err == nil {
+		return b
+	}
+	d.log.Error("encode event", "stream", stream, "err", err)
+	code := protocol.CodeInternal
+	if errors.Is(err, protocol.ErrTooLarge) {
+		code = protocol.CodeTooLarge
+	}
+	b, _ = protocol.Line(protocol.Event{Type: protocol.TypeEvent, Stream: stream, Error: fail(code, "%v", err)})
+	return b
 }

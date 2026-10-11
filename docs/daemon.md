@@ -27,7 +27,9 @@ file refuses everyone. The daemon serves at most 16 clients at once and refuses 
 
 ## Protocol
 
-JSON lines: one JSON object per line, UTF-8, at most 1 MiB. A longer line ends the connection.
+JSON lines: one JSON object per line, UTF-8, at most 1 MiB. A longer line from a client ends the
+connection. The daemon never sends one: a reply that would exceed the limit is sent as a
+`too_large` error for that request instead, and an event as an error event (see Streams).
 The vocabulary is proxies, groups, rules and connections; it never names the core behind them.
 
 The daemon speaks first:
@@ -50,8 +52,10 @@ test does not hold up a status read. A client may have 8 calls in flight; more a
 {"type":"reply","id":8,"error":{"code":"not_found","message":"not found"}}
 ```
 
-Arguments are strict: an unknown field, wrong type or trailing data is `bad_request`. Ops without
-arguments accept none, `null` or `{}`.
+Requests and their arguments are strict: an unknown field, a wrong type, or anything after the
+object, even a stray `}`, is `bad_request`. The error carries the request's `id` when the line is a
+JSON object with a numeric `id`, and `0` when it is not. Ops without arguments accept none, `null`
+or `{}`.
 
 | Op | Args | Result |
 | --- | --- | --- |
@@ -104,6 +108,13 @@ and later pushes reach every subscriber whoever caused the change, so a widget s
 the CLI changes something. The periodic streams cost nothing while no client subscribes. A client
 that stops reading until 256 messages are queued for it is disconnected.
 
+A value too large for one message is pushed as an error in place of `data`. The subscriber's copy
+of that stream is stale until a later push carries data again:
+
+```json
+{"type":"event","stream":"groups","error":{"code":"too_large","message":"..."}}
+```
+
 ### Errors
 
 | Code | Meaning |
@@ -118,6 +129,7 @@ that stops reading until 256 messages are queued for it is disconnected.
 | `busy` | too many calls or clients |
 | `forbidden` | the peer is not the owner |
 | `core_failed` | the core refused or failed the change |
+| `too_large` | the result does not fit in one message |
 | `internal` | a daemon bug |
 
 ## Command line
@@ -139,7 +151,9 @@ omihomo daemon [--core fake] [--socket PATH] [--owner-file PATH]
 ```
 
 Each command is one call. The result is one JSON line on stdout, indented with `--pretty`; a call
-with nothing to say prints nothing. `sub add` reads the URL from stdin so its token never appears
+with nothing to say prints nothing. Flags go before a command's arguments (`omihomo set tun
+--pretty on`), and `--` ends them, so a name that starts with a dash can still be passed. `-h` on
+any command prints its usage and exits 0. `sub add` reads the URL from stdin so its token never appears
 in a process list. `watch` subscribes to the named streams, all of them by default, and prints
 `{"stream","data"}` lines until interrupted. `OMIHOMO_SOCKET` points the client at another socket.
 Errors are one line on stderr.
@@ -148,7 +162,7 @@ Errors are one line on stderr.
 | ---: | --- |
 | 0 | success |
 | 1 | failure |
-| 2 | usage, or a value the daemon rejected as invalid |
+| 2 | usage, or a value the daemon rejected as invalid; usage is printed after the error |
 | 10 | no daemon answers on the socket |
 | 11 | the call conflicts with the current state, or needs the proxy running |
 | 12 | not found |

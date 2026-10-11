@@ -77,19 +77,22 @@ func Store(path string, uid int) error {
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".owner-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("store owner: %w", err)
 	}
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return err
+		return fmt.Errorf("store owner: %w", err)
 	}
 	if _, err := tmp.WriteString(strconv.Itoa(uid) + "\n"); err != nil {
 		tmp.Close()
-		return err
+		return fmt.Errorf("store owner: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return fmt.Errorf("store owner: %w", err)
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("store owner: %w", err)
+	}
+	return nil
 }

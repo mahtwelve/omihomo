@@ -59,11 +59,14 @@ type Reply struct {
 	Error  *Error `json:"error,omitempty"`
 }
 
-// Event is a push on a subscribed stream.
+// Event is a push on a subscribed stream. An event whose value cannot be
+// sent carries Error instead of Data: until the next push, the subscriber's
+// copy of the stream is stale.
 type Event struct {
 	Type   string `json:"type"`
 	Stream string `json:"stream"`
-	Data   any    `json:"data"`
+	Data   any    `json:"data,omitempty"`
+	Error  *Error `json:"error,omitempty"`
 }
 
 // Envelope is what a client decodes every daemon message into before it
@@ -99,6 +102,7 @@ const (
 	CodeBusy        = "busy"        // too many calls or clients at once
 	CodeForbidden   = "forbidden"   // the peer is not the owner
 	CodeCore        = "core_failed" // the core refused or failed the change
+	CodeTooLarge    = "too_large"   // the result does not fit in one message
 	CodeInternal    = "internal"
 )
 

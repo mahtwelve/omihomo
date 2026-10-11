@@ -4,6 +4,7 @@ package fakecore
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"slices"
 	"sync"
@@ -127,10 +128,10 @@ func (c *Core) Select(ctx context.Context, group, proxy string) error {
 	}
 	g := c.group(group)
 	if g == nil || !g.Selectable {
-		return core.ErrNotFound
+		return fmt.Errorf("selectable group %q: %w", group, core.ErrNotFound)
 	}
 	if !slices.ContainsFunc(g.Members, func(p protocol.Proxy) bool { return p.Name == proxy }) {
-		return core.ErrNotFound
+		return fmt.Errorf("proxy %q in group %q: %w", proxy, group, core.ErrNotFound)
 	}
 	g.Now = proxy
 	return nil
@@ -144,7 +145,7 @@ func (c *Core) TestDelay(ctx context.Context, group string, proxies []string) (m
 	}
 	g := c.group(group)
 	if g == nil {
-		return nil, core.ErrNotFound
+		return nil, fmt.Errorf("group %q: %w", group, core.ErrNotFound)
 	}
 	out := map[string]int{}
 	for _, m := range g.Members {
@@ -155,7 +156,7 @@ func (c *Core) TestDelay(ctx context.Context, group string, proxies []string) (m
 	}
 	for _, name := range proxies {
 		if _, ok := out[name]; !ok {
-			return nil, core.ErrNotFound
+			return nil, fmt.Errorf("proxy %q in group %q: %w", name, group, core.ErrNotFound)
 		}
 	}
 	for i := range c.groups {

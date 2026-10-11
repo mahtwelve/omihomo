@@ -38,11 +38,11 @@ func serve(t *testing.T, ownerUID int) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	d := daemon.New(daemon.Options{
-		Core: fakecore.New(), OwnerFile: ownerFile,
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
-		TailscalePresent: func() bool { return false },
-	})
+	d := daemon.New(fakecore.New(),
+		daemon.WithOwnerFile(ownerFile),
+		daemon.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		daemon.WithTailscaleProbe(func() bool { return false }),
+	)
 	go func() { d.Run(ctx, l); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 	t.Setenv("OMIHOMO_SOCKET", socket)
@@ -74,7 +74,7 @@ func TestCommandsRunOverTheSocket(t *testing.T) {
 	if code, out, _ := run(t, "", "set", "mode", "global"); code != cli.ExitOK || !strings.Contains(out, `"mode":"global"`) {
 		t.Fatalf("set mode: %d %q", code, out)
 	}
-	if code, out, _ := run(t, "", "set", "tun", "on", "--pretty"); code != cli.ExitOK || !strings.Contains(out, "\n  \"tun\": true") {
+	if code, out, _ := run(t, "", "set", "tun", "--pretty", "on"); code != cli.ExitOK || !strings.Contains(out, "\n  \"tun\": true") {
 		t.Fatalf("set tun --pretty: %d %q", code, out)
 	}
 	if code, out, _ := run(t, "", "group", "select", "Proxy", "Frankfurt"); code != cli.ExitOK || !strings.Contains(out, `"now":"Frankfurt"`) {
@@ -116,6 +116,66 @@ func TestUsageErrorsNeverReachTheDaemon(t *testing.T) {
 	}
 	if code, _, _ := run(t, "", "sub", "add"); code != cli.ExitUsage {
 		t.Errorf("sub add with empty stdin exit %d", code)
+	}
+}
+
+func TestHelpSucceeds(t *testing.T) {
+	t.Setenv("OMIHOMO_SOCKET", filepath.Join(t.TempDir(), "none"))
+	for _, args := range [][]string{
+		{"--help"},
+		{"-h"},
+		{"help"},
+		{"status", "--help"},
+		{"group", "select", "-h"},
+		{"set", "--help"},
+		{"daemon", "--help"},
+	} {
+		code, out, errOut := run(t, "", args...)
+		if code != cli.ExitOK || out != "" || !strings.Contains(errOut, "USAGE") {
+			t.Errorf("%v: exit %d, stdout %q, stderr %q", args, code, out, errOut)
+		}
+	}
+	if _, _, errOut := run(t, "", "--help"); !strings.Contains(errOut, "watch") || !strings.Contains(errOut, "daemon") {
+		t.Errorf("root help does not list every command: %q", errOut)
+	}
+}
+
+func TestArgumentsAreChecked(t *testing.T) {
+	t.Setenv("OMIHOMO_SOCKET", filepath.Join(t.TempDir(), "none"))
+	for _, args := range [][]string{
+		{},
+		{"version", "unexpected"},
+		{"status", "extra"},
+		{"set"},
+		{"set", "mode"},
+		{"set", "mode", "rule", "global"},
+		{"group", "select", "Proxy"},
+		{"group", "select", "Proxy", "Tokyo", "--pretty"},
+		{"conn", "close", "--all", "abc"},
+		{"status", "--verbose"},
+		{"daemon", "--core", "fake", "extra"},
+		{"daemon"},
+	} {
+		if code, _, errOut := run(t, "", args...); code != cli.ExitUsage || !strings.Contains(errOut, "USAGE") {
+			t.Errorf("%v: exit %d, stderr %q", args, code, errOut)
+		}
+	}
+}
+
+func TestFlagsEndAtDoubleDash(t *testing.T) {
+	serve(t, os.Getuid())
+	if code, _, errOut := run(t, "", "start"); code != cli.ExitOK {
+		t.Fatalf("start: %d %s", code, errOut)
+	}
+	code, _, errOut := run(t, "", "group", "select", "--", "Proxy", "--pretty")
+	if code != cli.ExitNotFound || !strings.Contains(errOut, "--pretty") {
+		t.Fatalf("select a proxy named --pretty: %d %q", code, errOut)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	if code, out, _ := run(t, "", "version"); code != cli.ExitOK || !strings.Contains(out, "protocol") {
+		t.Fatalf("version: %d %q", code, out)
 	}
 }
 

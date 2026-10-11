@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -11,9 +12,8 @@ import (
 	"github.com/readeem/omihomo/internal/protocol"
 )
 
-// session is one connected owner client.
 type session struct {
-	d    *Daemon
+	d    *server
 	conn net.Conn
 
 	out       chan []byte
@@ -26,7 +26,7 @@ type session struct {
 	streams map[string]bool
 }
 
-func newSession(d *Daemon, conn net.Conn) *session {
+func newSession(d *server, conn net.Conn) *session {
 	return &session{
 		d:        d,
 		conn:     conn,
@@ -46,8 +46,6 @@ func (s *session) close() {
 
 func (s *session) wants(stream string) bool { return s.streams[stream] }
 
-// send queues one message. A client that lets its queue fill is
-// disconnected rather than allowed to hold the daemon's memory.
 func (s *session) send(v any) {
 	b, err := protocol.Line(v)
 	if err != nil {
@@ -57,6 +55,8 @@ func (s *session) send(v any) {
 	s.sendLine(b)
 }
 
+// sendLine disconnects a client that lets its queue fill rather than let it
+// hold the daemon's memory.
 func (s *session) sendLine(b []byte) {
 	select {
 	case <-s.done:
@@ -67,7 +67,6 @@ func (s *session) sendLine(b []byte) {
 	}
 }
 
-// serve runs the session until the client leaves, misbehaves, or ctx ends.
 // A client that stops sending still gets the replies to what it asked.
 func (s *session) serve(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -99,10 +98,8 @@ func (s *session) serve(ctx context.Context) {
 			continue
 		}
 		var req protocol.Request
-		dec := json.NewDecoder(bytes.NewReader(line))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil || dec.More() {
-			s.reply(0, nil, &protocol.Error{Code: protocol.CodeBadRequest, Message: "not a request"})
+		if err := protocol.Decode(line, &req); err != nil {
+			s.reply(recoverID(line), nil, fail(protocol.CodeBadRequest, "not a request: %v", err))
 			continue
 		}
 		if req.ID == 0 || req.Op == "" {
@@ -125,19 +122,43 @@ func (s *session) serve(ctx context.Context) {
 	}
 }
 
-func (s *session) reply(id uint64, result any, err *protocol.Error) {
-	r := protocol.Reply{Type: protocol.TypeReply, ID: id, Error: err}
-	if err == nil {
+// recoverID is the id of a request that failed to decode, so its caller
+// can match the error. It is 0 when the line is not a JSON object with a
+// numeric id.
+func recoverID(line []byte) uint64 {
+	var probe struct {
+		ID uint64 `json:"id"`
+	}
+	if json.Unmarshal(line, &probe) != nil {
+		return 0
+	}
+	return probe.ID
+}
+
+// reply sends the one answer a request gets. A result too large to send
+// becomes a too_large error, so the call fails without ending the session.
+func (s *session) reply(id uint64, result any, perr *protocol.Error) {
+	r := protocol.Reply{Type: protocol.TypeReply, ID: id, Error: perr}
+	if perr == nil {
 		if result == nil {
 			result = protocol.Empty{}
 		}
 		r.Result = result
 	}
-	s.send(r)
+	b, err := protocol.Line(r)
+	if err != nil {
+		s.d.log.Error("encode reply", "id", id, "err", err)
+		code := protocol.CodeInternal
+		if errors.Is(err, protocol.ErrTooLarge) {
+			code = protocol.CodeTooLarge
+		}
+		b, _ = protocol.Line(protocol.Reply{Type: protocol.TypeReply, ID: id, Error: fail(code, "%v", err)})
+	}
+	s.sendLine(b)
 }
 
-// write sends queued messages until the session closes, or until drain
-// closes and the queue is empty.
+// write returns when the session closes, or once drain is closed and the
+// queue is empty.
 func (s *session) write(drain <-chan struct{}) {
 	put := func(b []byte) bool {
 		s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))

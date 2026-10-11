@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -13,6 +12,8 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/peterbourgon/ff/v3/ffcli"
+
 	"github.com/readeem/omihomo/internal/client"
 	"github.com/readeem/omihomo/internal/core"
 	"github.com/readeem/omihomo/internal/core/fakecore"
@@ -21,54 +22,51 @@ import (
 	"github.com/readeem/omihomo/internal/systemd"
 )
 
-// runDaemon serves until SIGTERM or SIGINT. Under systemd it takes the
-// socket from socket activation and reports readiness; started by hand it
-// binds the socket itself.
-func runDaemon(ctx context.Context, args []string, env Env) int {
-	flags := flag.NewFlagSet("omihomo daemon", flag.ContinueOnError)
-	flags.SetOutput(env.Stderr)
-	socket := flags.String("socket", client.DefaultSocket, "socket to bind when not socket-activated")
-	ownerFile := flags.String("owner-file", owner.DefaultPath, "file recording the owner's uid")
-	coreName := flags.String("core", "", "proxy core to run: fake")
-	if err := flags.Parse(args); err != nil {
-		return ExitUsage
+func (a *app) daemonCommand() *ffcli.Command {
+	set := a.flags("daemon")
+	socket := set.String("socket", client.DefaultSocket, "socket to bind when not socket-activated")
+	ownerFile := set.String("owner-file", owner.DefaultPath, "file recording the owner's uid")
+	coreName := set.String("core", "", "proxy core to run: fake")
+	cmd := &ffcli.Command{Name: "daemon", ShortUsage: "omihomo daemon [flags]", ShortHelp: "run the daemon",
+		LongHelp: "Serves until SIGTERM or SIGINT. Under systemd it takes the socket from socket\n" +
+			"activation and reports readiness; started by hand it binds --socket itself.",
+		FlagSet: set}
+	cmd.Exec = func(ctx context.Context, args []string) error {
+		if len(args) != 0 {
+			return usage(cmd, "daemon takes no arguments")
+		}
+		log := slog.New(slog.NewTextHandler(a.env.Stderr, nil))
+		var c core.Core
+		switch *coreName {
+		case "fake":
+			c = fakecore.New()
+			log.Warn("running the fake core: nothing is proxied")
+		case "":
+			return usage(cmd, "no proxy core is built in yet; pass --core fake")
+		default:
+			return usage(cmd, "unknown core %q", *coreName)
+		}
+		return serve(ctx, log, c, *socket, *ownerFile)
 	}
-	if flags.NArg() != 0 {
-		fmt.Fprintln(env.Stderr, "omihomo daemon takes no arguments")
-		return ExitUsage
-	}
-	log := slog.New(slog.NewTextHandler(env.Stderr, nil))
+	return cmd
+}
 
-	var c core.Core
-	switch *coreName {
-	case "fake":
-		c = fakecore.New()
-		log.Warn("running the fake core: nothing is proxied")
-	case "":
-		fmt.Fprintln(env.Stderr, "omihomo daemon: no proxy core is built in yet; pass --core fake")
-		return ExitUsage
-	default:
-		fmt.Fprintf(env.Stderr, "omihomo daemon: unknown core %q\n", *coreName)
-		return ExitUsage
-	}
-
+func serve(ctx context.Context, log *slog.Logger, c core.Core, socket, ownerFile string) error {
 	listeners, err := systemd.Listeners()
 	if err != nil {
-		log.Error("socket activation", "err", err)
-		return ExitFailure
+		return fmt.Errorf("socket activation: %w", err)
 	}
 	if len(listeners) == 0 {
-		l, err := listen(*socket, *ownerFile)
+		l, err := listen(socket, ownerFile)
 		if err != nil {
-			log.Error("bind the socket", "path", *socket, "err", err)
-			return ExitFailure
+			return fmt.Errorf("bind %s: %w", socket, err)
 		}
 		listeners = append(listeners, l)
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	d := daemon.New(daemon.Options{Core: c, OwnerFile: *ownerFile, Version: Version, Logger: log})
+	d := daemon.New(c, daemon.WithOwnerFile(ownerFile), daemon.WithVersion(Version), daemon.WithLogger(log))
 	if err := systemd.Notify("READY=1"); err != nil {
 		log.Warn("notify systemd", "err", err)
 	}
@@ -76,10 +74,9 @@ func runDaemon(ctx context.Context, args []string, env Env) int {
 	err = d.Run(ctx, listeners...)
 	systemd.Notify("STOPPING=1")
 	if err != nil {
-		log.Error("serve", "err", err)
-		return ExitFailure
+		return fmt.Errorf("serve: %w", err)
 	}
-	return ExitOK
+	return nil
 }
 
 // listen binds path as a socket only its owner can open. Under systemd the
@@ -93,7 +90,7 @@ func listen(path, ownerFile string) (net.Listener, error) {
 	dir := filepath.Dir(path)
 	info, err := os.Lstat(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("inspect the socket directory: %w", err)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !info.IsDir() || !ok || int(st.Uid) != os.Geteuid() || info.Mode().Perm()&0o022 != 0 {
@@ -108,10 +105,10 @@ func listen(path, ownerFile string) (net.Listener, error) {
 			return nil, fmt.Errorf("another daemon is serving %s", path)
 		}
 		if err := os.Remove(path); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("remove the stale socket: %w", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+		return nil, fmt.Errorf("inspect the socket path: %w", err)
 	}
 	old := syscall.Umask(0o177)
 	l, err := net.Listen("unix", path)

@@ -59,7 +59,7 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connect to %s: %w", path, err)
 	}
 	c := &Client{
 		conn:    conn,
@@ -73,7 +73,12 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 		deadline = d
 	}
 	conn.SetReadDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { conn.SetReadDeadline(time.Now()) })
 	env, err := c.read()
+	if !stop() {
+		conn.Close()
+		return nil, fmt.Errorf("read the daemon's greeting: %w", ctx.Err())
+	}
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read the daemon's greeting: %w", err)
@@ -167,7 +172,7 @@ func (c *Client) Call(ctx context.Context, op string, args, result any) error {
 	if args != nil {
 		raw, err := json.Marshal(args)
 		if err != nil {
-			return err
+			return fmt.Errorf("encode %s args: %w", op, err)
 		}
 		req.Args = raw
 	}
@@ -185,13 +190,13 @@ func (c *Client) Call(ctx context.Context, op string, args, result any) error {
 
 	line, err := protocol.Line(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("encode %s request: %w", op, err)
 	}
 	// A call cancelled before it is sent must not run.
 	c.writeMu.Lock()
 	if err := ctx.Err(); err != nil {
 		c.writeMu.Unlock()
-		return err
+		return fmt.Errorf("%s: %w", op, err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
@@ -201,19 +206,19 @@ func (c *Client) Call(ctx context.Context, op string, args, result any) error {
 	_, err = c.conn.Write(line)
 	c.writeMu.Unlock()
 	if err != nil {
-		return err
+		return fmt.Errorf("send %s request: %w", op, err)
 	}
 
 	var env protocol.Envelope
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("%s: %w", op, ctx.Err())
 	case <-c.done:
 		// The reply may have landed just before the connection closed.
 		select {
 		case env = <-ch:
 		default:
-			return ErrClosed
+			return fmt.Errorf("%s: %w", op, ErrClosed)
 		}
 	case env = <-ch:
 	}
@@ -223,5 +228,8 @@ func (c *Client) Call(ctx context.Context, op string, args, result any) error {
 	if result == nil {
 		return nil
 	}
-	return json.Unmarshal(env.Result, result)
+	if err := json.Unmarshal(env.Result, result); err != nil {
+		return fmt.Errorf("decode %s result: %w", op, err)
+	}
+	return nil
 }

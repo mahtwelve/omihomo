@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/readeem/omihomo/internal/client"
+	"github.com/readeem/omihomo/internal/core"
 	"github.com/readeem/omihomo/internal/core/fakecore"
 	"github.com/readeem/omihomo/internal/daemon"
 	"github.com/readeem/omihomo/internal/protocol"
@@ -32,7 +33,13 @@ type harness struct {
 
 // serve runs a daemon on a fresh socket with the given owner uid, or no
 // owner file at all when ownerUID is negative.
-func serve(t *testing.T, ownerUID int, tweak func(*daemon.Options)) *harness {
+func serve(t *testing.T, ownerUID int, opts ...daemon.ConfigOpt) *harness {
+	t.Helper()
+	return serveCore(t, ownerUID, fakecore.New(), opts...)
+}
+
+// serveCore is serve with a core of the caller's choosing.
+func serveCore(t *testing.T, ownerUID int, c core.Core, opts ...daemon.ConfigOpt) *harness {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "omihomo-test-") // short: socket paths are limited
 	if err != nil {
@@ -45,25 +52,22 @@ func serve(t *testing.T, ownerUID int, tweak func(*daemon.Options)) *harness {
 			t.Fatal(err)
 		}
 	}
-	h := &harness{socket: filepath.Join(dir, "s"), core: fakecore.New(), done: make(chan error, 1)}
+	h := &harness{socket: filepath.Join(dir, "s"), done: make(chan error, 1)}
+	h.core, _ = c.(*fakecore.Core)
 	l, err := net.Listen("unix", h.socket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := daemon.Options{
-		Core:             h.core,
-		OwnerFile:        ownerFile,
-		Version:          "test",
-		Tick:             10 * time.Millisecond,
-		TailscalePresent: func() bool { return true },
-		Logger:           discardLogger(),
-	}
-	if tweak != nil {
-		tweak(&opts)
-	}
+	opts = append([]daemon.ConfigOpt{
+		daemon.WithOwnerFile(ownerFile),
+		daemon.WithVersion("test"),
+		daemon.WithTick(10 * time.Millisecond),
+		daemon.WithTailscaleProbe(func() bool { return true }),
+		daemon.WithLogger(discardLogger()),
+	}, opts...)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
-	d := daemon.New(opts)
+	d := daemon.New(c, opts...)
 	go func() { h.done <- d.Run(ctx, l) }()
 	t.Cleanup(func() {
 		cancel()
@@ -132,7 +136,7 @@ func ptr[T any](v T) *T { return &v }
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func TestOwnerIsGreeted(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	if c.Hello.Protocol != protocol.Version || c.Hello.Version != "test" {
 		t.Fatalf("hello = %+v", c.Hello)
@@ -144,15 +148,15 @@ func TestOwnerIsGreeted(t *testing.T) {
 
 func TestAnyoneElseIsRefused(t *testing.T) {
 	cases := map[string]func(t *testing.T) *harness{
-		"another uid owns it": func(t *testing.T) *harness { return serve(t, os.Getuid()+1, nil) },
-		"nobody claimed it":   func(t *testing.T) *harness { return serve(t, -1, nil) },
+		"another uid owns it": func(t *testing.T) *harness { return serve(t, os.Getuid()+1) },
+		"nobody claimed it":   func(t *testing.T) *harness { return serve(t, -1) },
 		"the owner file is writable by others": func(t *testing.T) *harness {
-			h := serve(t, os.Getuid(), nil)
+			h := serve(t, os.Getuid())
 			os.Chmod(filepath.Join(filepath.Dir(h.socket), "owner"), 0o666)
 			return h
 		},
 		"the owner file is a symlink": func(t *testing.T) *harness {
-			h := serve(t, -1, nil)
+			h := serve(t, -1)
 			dir := filepath.Dir(h.socket)
 			os.WriteFile(filepath.Join(dir, "real"), []byte(fmt.Sprint(os.Getuid())), 0o600)
 			os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "owner"))
@@ -190,7 +194,7 @@ func TestAnyoneElseIsRefused(t *testing.T) {
 }
 
 func TestStartStop(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	if err := callErr(t, c, protocol.OpGroups, nil); err.Code != protocol.CodeNotRunning {
 		t.Fatalf("groups while stopped = %v", err)
@@ -212,7 +216,7 @@ func TestStartStop(t *testing.T) {
 }
 
 func TestFailedStartReportsWhy(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	h.core.FailApply(errors.New("tun device busy"))
 	c := h.dial(t)
 	if err := callErr(t, c, protocol.OpStart, nil); err.Code != protocol.CodeCore {
@@ -225,7 +229,7 @@ func TestFailedStartReportsWhy(t *testing.T) {
 }
 
 func TestSettings(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 
 	st := call[protocol.Status](t, c, protocol.OpSetSettings, protocol.SettingsArgs{Mode: ptr("global"), TUN: ptr(true)})
@@ -265,7 +269,7 @@ func TestSettings(t *testing.T) {
 }
 
 func TestTailscaleNeedsTailscaled(t *testing.T) {
-	h := serve(t, os.Getuid(), func(o *daemon.Options) { o.TailscalePresent = func() bool { return false } })
+	h := serve(t, os.Getuid(), daemon.WithTailscaleProbe(func() bool { return false }))
 	c := h.dial(t)
 	if err := callErr(t, c, protocol.OpSetSettings, protocol.SettingsArgs{Tailscale: ptr(true)}); err.Code != protocol.CodeConflict {
 		t.Fatalf("tailscale on = %v", err)
@@ -274,7 +278,7 @@ func TestTailscaleNeedsTailscaled(t *testing.T) {
 }
 
 func TestGroups(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	call[protocol.Status](t, c, protocol.OpStart, nil)
 
@@ -303,7 +307,7 @@ func TestGroups(t *testing.T) {
 }
 
 func TestRulesAndConnections(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	if rules := call[protocol.RuleList](t, c, protocol.OpRules, nil); len(rules.Rules) != 0 {
 		t.Fatalf("rules while stopped = %+v", rules)
@@ -337,7 +341,7 @@ func TestEgress(t *testing.T) {
 		fmt.Fprint(w, "fl=1\nip=203.0.113.7\nloc=NL\n")
 	}))
 	defer trace.Close()
-	h := serve(t, os.Getuid(), func(o *daemon.Options) { o.EgressURL = trace.URL })
+	h := serve(t, os.Getuid(), daemon.WithEgressURL(trace.URL))
 	c := h.dial(t)
 	if err := callErr(t, c, protocol.OpEgress, nil); err.Code != protocol.CodeNotRunning {
 		t.Fatalf("egress while stopped = %v", err)
@@ -350,7 +354,7 @@ func TestEgress(t *testing.T) {
 }
 
 func TestUnsupportedOpsAreNamed(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	for _, op := range []string{protocol.OpSubscriptions, protocol.OpSubscriptionAdd, protocol.OpRuleAdd} {
 		if err := callErr(t, c, op, nil); err.Code != protocol.CodeUnsupported {
@@ -363,7 +367,7 @@ func TestUnsupportedOpsAreNamed(t *testing.T) {
 }
 
 func TestStateStreams(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	watcher := h.dial(t)
 	call[protocol.Empty](t, watcher, protocol.OpSubscribe, protocol.StreamsArgs{Streams: []string{"status", "groups"}})
 
@@ -397,7 +401,7 @@ func TestStateStreams(t *testing.T) {
 }
 
 func TestPeriodicStreams(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	call[protocol.Status](t, c, protocol.OpStart, nil)
 	call[protocol.Empty](t, c, protocol.OpSubscribe, protocol.StreamsArgs{Streams: []string{"traffic", "connections"}})
@@ -431,25 +435,38 @@ func raw(t *testing.T, h *harness) (net.Conn, *bufio.Scanner) {
 }
 
 func TestMalformedRequests(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	conn, s := raw(t, h)
-	for line, code := range map[string]string{
-		`not json`:                                    protocol.CodeBadRequest,
-		`{"op":"status"}`:                             protocol.CodeBadRequest,
-		`{"id":1,"op":"status","extra":true}`:         protocol.CodeBadRequest,
-		`{"id":2,"op":"settings.set","args":{"x":1}}`: protocol.CodeBadRequest,
-		`{"id":3,"op":"settings.set","args":[]}`:      protocol.CodeBadRequest,
-		`{"id":4,"op":"status","args":{"verbose":1}}`: protocol.CodeBadRequest,
+	for _, tc := range []struct {
+		line string
+		id   uint64
+	}{
+		{`not json`, 0},
+		{`{"op":"status"}`, 0},
+		{`{"id":"5","op":"status"}`, 0},
+		{`{"id":1,"op":"start"}}`, 0},
+		{`{"id":1,"op":"start"}]`, 0},
+		{`{"id":1,"op":"start"} {"id":2,"op":"start"}`, 0},
+		{`{"id":1,"op":"start"} 7`, 0},
+		{`{"id":73,"op":"status","extra":true}`, 73},
+		{`{"extra":true,"id":74,"op":"status"}`, 74},
+		{`{"id":75,"op":5}`, 75},
+		{`{"id":2,"op":"settings.set","args":{"x":1}}`, 2},
+		{`{"id":3,"op":"settings.set","args":[]}`, 3},
+		{`{"id":4,"op":"status","args":{"verbose":1}}`, 4},
 	} {
-		fmt.Fprintln(conn, line)
+		fmt.Fprintln(conn, tc.line)
 		if !s.Scan() {
-			t.Fatalf("%s: no reply", line)
+			t.Fatalf("%s: no reply", tc.line)
 		}
 		var env protocol.Envelope
 		json.Unmarshal(s.Bytes(), &env)
-		if env.Error == nil || env.Error.Code != code {
-			t.Errorf("%s: reply %s", line, s.Text())
+		if env.Type != protocol.TypeReply || env.ID != tc.id || env.Error == nil || env.Error.Code != protocol.CodeBadRequest {
+			t.Errorf("%s: reply %s, want bad_request for id %d", tc.line, s.Text(), tc.id)
 		}
+	}
+	if _, running := h.core.Config(); running {
+		t.Fatal("a malformed start ran")
 	}
 
 	// A line past the limit ends the session.
@@ -459,8 +476,56 @@ func TestMalformedRequests(t *testing.T) {
 	}
 }
 
+// hugeGroups is the fake core with a group list too large for one message.
+type hugeGroups struct{ *fakecore.Core }
+
+func (c hugeGroups) Groups(ctx context.Context) ([]protocol.Group, error) {
+	if _, err := c.Core.Groups(ctx); err != nil {
+		return nil, err
+	}
+	g := protocol.Group{Name: "Huge", Type: "select", Selectable: true}
+	for i := range 5000 {
+		g.Members = append(g.Members, protocol.Proxy{Name: fmt.Sprintf("%04d-%s", i, strings.Repeat("x", 230))})
+	}
+	g.Now = g.Members[0].Name
+	return []protocol.Group{g}, nil
+}
+
+func TestOversizedResultsFailOnlyTheirCall(t *testing.T) {
+	h := serveCore(t, os.Getuid(), hugeGroups{fakecore.New()})
+	c := h.dial(t)
+	call[protocol.Status](t, c, protocol.OpStart, nil)
+
+	if err := callErr(t, c, protocol.OpGroups, nil); err.Code != protocol.CodeTooLarge {
+		t.Fatalf("groups.list = %v, want too_large", err)
+	}
+	if st := call[protocol.Status](t, c, protocol.OpStatus, nil); st.State != protocol.StateOn {
+		t.Fatalf("status after an oversized reply: %+v", st)
+	}
+
+	call[protocol.Empty](t, c, protocol.OpSubscribe, protocol.StreamsArgs{Streams: []string{protocol.StreamGroups}})
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev, ok := <-c.Events():
+			if !ok {
+				t.Fatal("connection closed by an oversized event")
+			}
+			if ev.Stream != protocol.StreamGroups {
+				continue
+			}
+			if ev.Error == nil || ev.Error.Code != protocol.CodeTooLarge || len(ev.Data) != 0 {
+				t.Fatalf("groups event = %+v, want a too_large error", ev)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no groups event")
+		}
+	}
+}
+
 func TestAClientThatStopsSendingStillGetsItsReplies(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	conn, s := raw(t, h)
 	fmt.Fprintln(conn, `{"id":1,"op":"start"}`)
 	fmt.Fprintln(conn, `{"id":2,"op":"rules.list"}`)
@@ -480,7 +545,7 @@ func TestAClientThatStopsSendingStillGetsItsReplies(t *testing.T) {
 }
 
 func TestACancelledCallIsNeverSent(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -494,7 +559,7 @@ func TestACancelledCallIsNeverSent(t *testing.T) {
 }
 
 func TestClientsAreBounded(t *testing.T) {
-	h := serve(t, os.Getuid(), func(o *daemon.Options) { o.MaxClients = 1 })
+	h := serve(t, os.Getuid(), daemon.WithMaxClients(1))
 	h.dial(t)
 	_, err := client.Dial(context.Background(), h.socket)
 	var perr *protocol.Error
@@ -504,7 +569,7 @@ func TestClientsAreBounded(t *testing.T) {
 }
 
 func TestShutdownStopsTheCore(t *testing.T) {
-	h := serve(t, os.Getuid(), nil)
+	h := serve(t, os.Getuid())
 	c := h.dial(t)
 	call[protocol.Status](t, c, protocol.OpStart, nil)
 	h.cancel()

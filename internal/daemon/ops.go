@@ -19,7 +19,6 @@ import (
 	"github.com/readeem/omihomo/internal/protocol"
 )
 
-// settings are the typed settings clients may change.
 type settings struct {
 	mode         string
 	tun          bool
@@ -64,14 +63,11 @@ func coreError(err error) *protocol.Error {
 	}
 }
 
-// decode reads args strictly: unknown fields and trailing data are errors.
 func decode(raw json.RawMessage, v any) *protocol.Error {
 	if len(raw) == 0 || string(raw) == "null" {
 		raw = json.RawMessage("{}")
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil || dec.More() {
+	if err := protocol.Decode(raw, v); err != nil {
 		return fail(protocol.CodeBadRequest, "invalid args: %v", err)
 	}
 	return nil
@@ -99,7 +95,7 @@ func validNames(what string, names []string) *protocol.Error {
 	return nil
 }
 
-func (d *Daemon) handle(ctx context.Context, s *session, req protocol.Request) (any, *protocol.Error) {
+func (d *server) handle(ctx context.Context, s *session, req protocol.Request) (any, *protocol.Error) {
 	switch req.Op {
 	case protocol.OpStatus:
 		if err := decode(req.Args, &struct{}{}); err != nil {
@@ -132,7 +128,7 @@ func (d *Daemon) handle(ctx context.Context, s *session, req protocol.Request) (
 		if err := decode(req.Args, &struct{}{}); err != nil {
 			return nil, err
 		}
-		groups, err := d.opts.Core.Groups(ctx)
+		groups, err := d.core.Groups(ctx)
 		if err != nil {
 			return nil, coreError(err)
 		}
@@ -158,7 +154,7 @@ func (d *Daemon) handle(ctx context.Context, s *session, req protocol.Request) (
 		if err := decode(req.Args, &struct{}{}); err != nil {
 			return nil, err
 		}
-		conns, err := d.opts.Core.Connections(ctx)
+		conns, err := d.core.Connections(ctx)
 		if err != nil {
 			return nil, coreError(err)
 		}
@@ -182,7 +178,7 @@ func (d *Daemon) handle(ctx context.Context, s *session, req protocol.Request) (
 	}
 }
 
-func (d *Daemon) status() protocol.Status {
+func (d *server) status() protocol.Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return protocol.Status{
@@ -193,7 +189,7 @@ func (d *Daemon) status() protocol.Status {
 		TUN:              d.settings.tun,
 		TUNRedirect:      d.settings.tunRedirect,
 		Tailscale:        d.settings.tailscale,
-		TailscalePresent: d.opts.TailscalePresent(),
+		TailscalePresent: d.cfg.tailscalePresent(),
 		TailnetProxy:     d.settings.tailnetProxy,
 		StartedAt:        d.startedAt,
 		TUNBypass:        []string{},
@@ -204,13 +200,12 @@ var stateStreams = []string{protocol.StreamStatus, protocol.StreamGroups, protoc
 
 var allStreams = append(slices.Clone(stateStreams), protocol.StreamTraffic, protocol.StreamConnections)
 
-// snapshot is the current value of a state stream.
-func (d *Daemon) snapshot(ctx context.Context, stream string) any {
+func (d *server) snapshot(ctx context.Context, stream string) any {
 	switch stream {
 	case protocol.StreamStatus:
 		return d.status()
 	case protocol.StreamGroups:
-		groups, err := d.opts.Core.Groups(ctx)
+		groups, err := d.core.Groups(ctx)
 		if err != nil {
 			groups = []protocol.Group{}
 		}
@@ -222,8 +217,7 @@ func (d *Daemon) snapshot(ctx context.Context, stream string) any {
 	return nil
 }
 
-// publish pushes the state streams whose value changed since the last push.
-func (d *Daemon) publish(ctx context.Context) {
+func (d *server) publish(ctx context.Context) {
 	d.pubMu.Lock()
 	defer d.pubMu.Unlock()
 	for _, stream := range stateStreams {
@@ -232,13 +226,9 @@ func (d *Daemon) publish(ctx context.Context) {
 }
 
 // publishLocked pushes stream to its subscribers if it changed, and to also
-// whether it changed or not. The caller holds pubMu.
-func (d *Daemon) publishLocked(ctx context.Context, stream string, also *session) {
-	b, err := protocol.Line(protocol.Event{Type: protocol.TypeEvent, Stream: stream, Data: d.snapshot(ctx, stream)})
-	if err != nil {
-		d.log.Error("encode event", "stream", stream, "err", err)
-		return
-	}
+// regardless. The caller holds pubMu.
+func (d *server) publishLocked(ctx context.Context, stream string, also *session) {
+	b := d.eventLine(stream, d.snapshot(ctx, stream))
 	if !bytes.Equal(d.lastPushed[stream], b) {
 		d.lastPushed[stream] = b
 		for _, s := range d.subscribers(stream) {
@@ -252,9 +242,8 @@ func (d *Daemon) publishLocked(ctx context.Context, stream string, also *session
 	}
 }
 
-// subscribe changes which streams s receives. Subscribing to a state stream
-// pushes its current value before the reply.
-func (d *Daemon) subscribe(ctx context.Context, s *session, streams []string, on bool) (any, *protocol.Error) {
+// Subscribing to a state stream pushes its current value before the reply.
+func (d *server) subscribe(ctx context.Context, s *session, streams []string, on bool) (any, *protocol.Error) {
 	if len(streams) == 0 {
 		return nil, fail(protocol.CodeInvalid, "no streams named")
 	}
@@ -286,7 +275,7 @@ func (d *Daemon) subscribe(ctx context.Context, s *session, streams []string, on
 	return protocol.Empty{}, nil
 }
 
-func (d *Daemon) setState(state, detail string) {
+func (d *server) setState(state, detail string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.state = state
@@ -301,7 +290,7 @@ func (d *Daemon) setState(state, detail string) {
 	}
 }
 
-func (d *Daemon) start(ctx context.Context) (any, *protocol.Error) {
+func (d *server) start(ctx context.Context) (any, *protocol.Error) {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	if d.running() {
@@ -312,7 +301,7 @@ func (d *Daemon) start(ctx context.Context) (any, *protocol.Error) {
 	d.mu.Lock()
 	cfg := d.settings.config()
 	d.mu.Unlock()
-	if err := d.opts.Core.Apply(ctx, cfg); err != nil {
+	if err := d.core.Apply(ctx, cfg); err != nil {
 		d.log.Error("start the proxy", "err", err)
 		d.setState(protocol.StateStopped, err.Error())
 		d.publish(ctx)
@@ -324,10 +313,10 @@ func (d *Daemon) start(ctx context.Context) (any, *protocol.Error) {
 	return d.status(), nil
 }
 
-func (d *Daemon) stop(ctx context.Context) (any, *protocol.Error) {
+func (d *server) stop(ctx context.Context) (any, *protocol.Error) {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
-	if err := d.opts.Core.Stop(ctx); err != nil {
+	if err := d.core.Stop(ctx); err != nil {
 		d.log.Error("stop the proxy", "err", err)
 		return nil, coreError(err)
 	}
@@ -337,7 +326,7 @@ func (d *Daemon) stop(ctx context.Context) (any, *protocol.Error) {
 	return d.status(), nil
 }
 
-func (d *Daemon) setSettings(ctx context.Context, args protocol.SettingsArgs) (any, *protocol.Error) {
+func (d *server) setSettings(ctx context.Context, args protocol.SettingsArgs) (any, *protocol.Error) {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	d.mu.Lock()
@@ -365,7 +354,7 @@ func (d *Daemon) setSettings(ctx context.Context, args protocol.SettingsArgs) (a
 		next.tailnetProxy = *args.TailnetProxy
 	}
 	if (args.Tailscale != nil && *args.Tailscale || args.TailnetProxy != nil && *args.TailnetProxy) &&
-		!d.opts.TailscalePresent() {
+		!d.cfg.tailscalePresent() {
 		return nil, fail(protocol.CodeConflict, "tailscaled is not installed")
 	}
 	running := d.running()
@@ -376,7 +365,7 @@ func (d *Daemon) setSettings(ctx context.Context, args protocol.SettingsArgs) (a
 				return nil, err
 			}
 			if running {
-				groups, err := d.opts.Core.Groups(ctx)
+				groups, err := d.core.Groups(ctx)
 				if err != nil {
 					return nil, coreError(err)
 				}
@@ -389,7 +378,7 @@ func (d *Daemon) setSettings(ctx context.Context, args protocol.SettingsArgs) (a
 	}
 
 	if running {
-		if err := d.opts.Core.Apply(ctx, next.config()); err != nil {
+		if err := d.core.Apply(ctx, next.config()); err != nil {
 			d.log.Error("apply settings", "err", err)
 			return nil, coreError(err)
 		}
@@ -401,18 +390,18 @@ func (d *Daemon) setSettings(ctx context.Context, args protocol.SettingsArgs) (a
 	return d.status(), nil
 }
 
-func (d *Daemon) selectProxy(ctx context.Context, args protocol.SelectArgs) (any, *protocol.Error) {
+func (d *server) selectProxy(ctx context.Context, args protocol.SelectArgs) (any, *protocol.Error) {
 	if err := validName("group", args.Group); err != nil {
 		return nil, err
 	}
 	if err := validName("proxy", args.Proxy); err != nil {
 		return nil, err
 	}
-	if err := d.opts.Core.Select(ctx, args.Group, args.Proxy); err != nil {
+	if err := d.core.Select(ctx, args.Group, args.Proxy); err != nil {
 		return nil, coreError(err)
 	}
 	d.publish(ctx)
-	groups, err := d.opts.Core.Groups(ctx)
+	groups, err := d.core.Groups(ctx)
 	if err != nil {
 		return nil, coreError(err)
 	}
@@ -424,14 +413,14 @@ func (d *Daemon) selectProxy(ctx context.Context, args protocol.SelectArgs) (any
 	return nil, fail(protocol.CodeNotFound, "group %q is gone", args.Group)
 }
 
-func (d *Daemon) testDelay(ctx context.Context, args protocol.DelayArgs) (any, *protocol.Error) {
+func (d *server) testDelay(ctx context.Context, args protocol.DelayArgs) (any, *protocol.Error) {
 	if err := validName("group", args.Group); err != nil {
 		return nil, err
 	}
 	if err := validNames("proxy", args.Proxies); err != nil {
 		return nil, err
 	}
-	delays, err := d.opts.Core.TestDelay(ctx, args.Group, args.Proxies)
+	delays, err := d.core.TestDelay(ctx, args.Group, args.Proxies)
 	if err != nil {
 		return nil, coreError(err)
 	}
@@ -439,8 +428,8 @@ func (d *Daemon) testDelay(ctx context.Context, args protocol.DelayArgs) (any, *
 	return protocol.DelayResult{Delays: delays}, nil
 }
 
-func (d *Daemon) rules(ctx context.Context) (protocol.RuleList, *protocol.Error) {
-	rules, err := d.opts.Core.Rules(ctx)
+func (d *server) rules(ctx context.Context) (protocol.RuleList, *protocol.Error) {
+	rules, err := d.core.Rules(ctx)
 	if errors.Is(err, core.ErrNotRunning) {
 		return protocol.RuleList{Rules: []protocol.Rule{}}, nil
 	}
@@ -450,7 +439,7 @@ func (d *Daemon) rules(ctx context.Context) (protocol.RuleList, *protocol.Error)
 	return protocol.RuleList{Rules: rules}, nil
 }
 
-func (d *Daemon) closeConnections(ctx context.Context, args protocol.CloseArgs) (any, *protocol.Error) {
+func (d *server) closeConnections(ctx context.Context, args protocol.CloseArgs) (any, *protocol.Error) {
 	if args.All == (len(args.IDs) > 0) {
 		return nil, fail(protocol.CodeInvalid, "name either connection ids or all")
 	}
@@ -460,15 +449,13 @@ func (d *Daemon) closeConnections(ctx context.Context, args protocol.CloseArgs) 
 	} else if err := validNames("connection id", ids); err != nil {
 		return nil, err
 	}
-	if err := d.opts.Core.CloseConnections(ctx, ids); err != nil {
+	if err := d.core.CloseConnections(ctx, ids); err != nil {
 		return nil, coreError(err)
 	}
 	return protocol.Empty{}, nil
 }
 
-// egress fetches a trace through the proxy, the way a local application's
-// request would leave.
-func (d *Daemon) egress(ctx context.Context) (any, *protocol.Error) {
+func (d *server) egress(ctx context.Context) (any, *protocol.Error) {
 	if !d.running() {
 		return nil, fail(protocol.CodeNotRunning, "the proxy is not running")
 	}
@@ -476,10 +463,10 @@ func (d *Daemon) egress(ctx context.Context) (any, *protocol.Error) {
 	defer cancel()
 	client := &http.Client{Transport: &http.Transport{
 		Proxy:             nil,
-		DialContext:       d.opts.Core.DialContext,
+		DialContext:       d.core.DialContext,
 		DisableKeepAlives: true,
 	}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.opts.EgressURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.cfg.egressURL, nil)
 	if err != nil {
 		return nil, fail(protocol.CodeInternal, "%v", err)
 	}

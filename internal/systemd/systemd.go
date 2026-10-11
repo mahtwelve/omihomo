@@ -33,14 +33,13 @@ func Listeners() ([]net.Listener, error) {
 			for _, l := range out {
 				l.Close()
 			}
-			return nil, fmt.Errorf("socket activation fd %d: %w", fd, err)
+			return nil, fmt.Errorf("fd %d: %w", fd, err)
 		}
 		out = append(out, l)
 	}
 	return out, nil
 }
 
-// activated is how many fds systemd passed, given its environment.
 func activated(pid, fds string, self int) (int, error) {
 	if pid == "" || fds == "" {
 		return 0, nil
@@ -68,9 +67,11 @@ func Notify(state string) error {
 	}
 	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: addr, Net: "unixgram"})
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to %s: %w", os.Getenv("NOTIFY_SOCKET"), err)
 	}
 	defer conn.Close()
-	_, err = conn.Write([]byte(state))
-	return err
+	if _, err := conn.Write([]byte(state)); err != nil {
+		return fmt.Errorf("send %s: %w", state, err)
+	}
+	return nil
 }
