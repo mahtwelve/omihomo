@@ -5,7 +5,7 @@
 
 const test = require("node:test")
 const assert = require("node:assert/strict")
-const Model = require("../Model.js")
+const Model = require("../widget/Model.js")
 
 test("status parses the CLI's stable object", () => {
   const status = Model.parseStatus(JSON.stringify({

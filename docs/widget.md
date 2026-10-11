@@ -1,15 +1,22 @@
 # Omihomo widget
 
-The plugin's bar widget. Omarchy loads `Panel.qml` as a `bar-widget`; everything else in the
-plugin folder is loaded from there.
+The plugin's bar widget, in `widget/`. Omarchy loads `widget/Panel.qml` as a `bar-widget`; everything
+else in that folder is loaded from there.
 
 | File | Role |
 | --- | --- |
 | `manifest.json` | Plugin id `omihomo`, one bar-widget entry point, one setting |
-| `Panel.qml` | Bar button, the popup's header, tabs, five views, and every row component |
-| `Service.qml` | All state: CLI calls, mihomo API calls, polling, and actions |
-| `Model.js` | Pure parsing and formatting, tested by `tests/model_test.js` |
-| `OmihomoIcon.qml` | The bar mark, drawn natively rather than shipped as an SVG |
+| `widget/Panel.qml` | Bar button, the popup's header, tabs, and key hints; the panel state and the cursor and key handling for every view |
+| `widget/views/` | One file per view (`ConfigsView`, `SubscriptionsView`, `RulesView`, `ConnectionsView`, `SettingsView`) and the rows only that view uses |
+| `widget/components/` | Shared pieces: `Theme`, text, buttons, fields, the switch, tabs, `TrafficGraph`, `FlowDiagram`, and `NavRow`, the base of every cursor row |
+| `widget/Service.qml` | All state: CLI calls, mihomo API calls, polling, and actions |
+| `widget/Model.js` | Pure parsing and formatting, tested by `tests/model_test.js` |
+| `widget/OmihomoIcon.qml` | The bar mark, drawn natively rather than shipped as an SVG |
+
+Views and rows take the panel as `panel`, and read its state, its `service`, and its `theme` from
+it; they never reach the panel's ids by name, and neither do `NavRow` and `ViewTab`, which take the
+panel too. The other shared components take only the `theme`. A view exposes the fields and lists
+the panel's cursor needs to focus and scroll, so the cursor and the keys stay in `Panel.qml`.
 
 ## Boundaries
 
@@ -104,7 +111,7 @@ cycles through them, and activating the target swaps the list for a filterable p
 view with the form taking keys from anywhere in the panel.
 
 The **connections view** is the same popup over a log rather than a live list. `GET /connections`
-only states what is open right now, so `Service.qml` keeps its own record: every poll is diffed
+only states what is open right now, so `widget/Service.qml` keeps its own record: every poll is diffed
 against the one before it, and an id that has stopped appearing is retained as a closed entry with
 the last figures it reported. The view draws open traffic as process → config flows.
 Labels use the process path or the API's process name; internal core
@@ -219,7 +226,7 @@ touch the real service or configuration.
 ```sh
 mkdir -p /tmp/omihomo-lint/qs
 cp -r /usr/share/omarchy/shell/{Commons,Ui} /tmp/omihomo-lint/qs/
-/usr/lib/qt6/bin/qmllint -I /tmp/omihomo-lint Panel.qml Service.qml OmihomoIcon.qml
+cd widget && /usr/lib/qt6/bin/qmllint -I /tmp/omihomo-lint *.qml components/*.qml views/*.qml
 ```
 
 Expect warnings in the same categories the first-party panels produce (`unqualified`,
@@ -227,7 +234,7 @@ Expect warnings in the same categories the first-party panels produce (`unqualif
 
 To see the widget run, start a nested Hyprland (`Hyprland -c <minimal config>`), run
 `quickshell` inside it against a config root holding `qs/Commons`, `qs/Ui`, and a host
-`shell.qml` that loads `Panel.qml` and injects a stand-in `bar`. Point the CLI at fixtures with
+`shell.qml` that loads `widget/Panel.qml` and injects a stand-in `bar`. Point the CLI at fixtures with
 `XDG_DATA_HOME`, `OMIHOMO_SYSTEMCTL`, `OMIHOMO_MIHOMO_BIN`, and `OMIHOMO_YQ`, and serve the
 controller endpoints from a local stub. That runs the real widget against a fake core without
 touching the live bar or the user's mihomo state.
@@ -241,7 +248,7 @@ tools/screenshots/capture            # rewrites preview.png and assets/screensho
 tools/screenshots/capture /tmp/shots # or writes them somewhere else
 ```
 
-It renders the real `Panel.qml` offscreen in Quickshell at 2× and saves each view, then composes
+It renders the real `widget/Panel.qml` offscreen in Quickshell at 2× and saves each view, then composes
 `preview.png` from the configs, connections, and rules views over the Tokyo Night wallpaper. Each
 view is 420×720 plus a one-pixel wallpaper edge; the preview is a 1600×900 desktop at 1.5×.
 

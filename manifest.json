@@ -10,7 +10,7 @@
     "bar-widget"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "widget/Panel.qml"
   },
   "barWidget": {
     "displayName": "Omihomo",

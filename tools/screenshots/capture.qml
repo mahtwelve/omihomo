@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Commons
 import qs.Commons as Commons
-import "omihomo" as Omihomo
+import "omihomo/widget" as Omihomo
 
 // Opens the real panel against the fake CLI and controller, saves each view,
 // then composes the README preview from three of them over the wallpaper.
