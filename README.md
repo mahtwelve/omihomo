@@ -225,10 +225,10 @@ rm ~/.config/omarchy/plugins/dev.readeem.omihomo
 the real config, or the network. See [tests/README.md](tests/README.md).
 
 ```text
-Panel.qml, Service.qml, Model.js, OmihomoIcon.qml   the bar widget
-bin/omihomo, libexec/, lib/                          the CLI
-tests/                                               both test suites
-docs/                                                CLI and widget reference, ADRs
+widget/                       the bar widget
+bin/omihomo, libexec/, lib/   the CLI
+tests/                        both test suites
+docs/                         CLI and widget reference, ADRs
 ```
 
 ## License
