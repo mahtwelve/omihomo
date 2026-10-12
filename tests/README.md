@@ -43,3 +43,13 @@ OMIHOMO_TEST_YQ=/path/to/yq ./tests/run
 
 The rest of the panel QML is checked with `qmllint` and by running the real widget against
 fixture data in a nested compositor. See [docs/widget.md](../docs/widget.md).
+
+The Go daemon and its command line are tested with `go test ./...` (see
+[docs/daemon.md](../docs/daemon.md)). Those tests run a real daemon on a temporary socket against
+the fake core in `internal/core/fakecore`. They connect as the owner and verify that any other uid,
+a missing owner, or an untrusted owner file is refused before a request is read. CI runs them with
+`go vet`, `govulncheck` and `tests/run` on every pull request.
+
+CI runs `tests/run` in an Arch Linux container with Quickshell and the `shell/Commons` imports of
+the Omarchy release the widget targets, and sets `OMIHOMO_REQUIRE_QML=1`, which turns the skipped
+QML service suites into a failure.
