@@ -11,7 +11,7 @@ Subscriptions, groups, latency, rules, TUN, and live connections, one keypress a
 
 [![Omarchy 4](https://img.shields.io/badge/Omarchy-4-7aa2f7)](https://omarchy.org)
 [![Bar widget](https://img.shields.io/badge/plugin-bar%20widget-bb9af7)](manifest.json)
-[![License: MIT](https://img.shields.io/badge/license-MIT-9ece6a)](LICENSE)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-9ece6a)](LICENSE)
 
 ![Omihomo's configs, connections, and rules views open over the Omarchy desktop](preview.png)
 
@@ -233,7 +233,11 @@ docs/                                                CLI and widget reference, A
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GNU General Public License, version 3 only (`GPL-3.0-only`). See [LICENSE](LICENSE).
 
-Omihomo installs and drives mihomo but does not bundle or redistribute it. mihomo is licensed under
-GPL-3.0 and comes from the AUR as `mihomo-bin`.
+mihomo is licensed under GPL-3.0. Omihomo is moving the core into its own daemon, which embeds
+mihomo as a Go library, so Omihomo's release binary will contain mihomo. Until then, Omihomo
+installs mihomo from the AUR as `mihomo-bin`.
+
+Code contributed before the change to GPL-3.0-only was released under the MIT License. Its copyright
+and permission notice is preserved in [LICENSES/MIT.txt](LICENSES/MIT.txt).
