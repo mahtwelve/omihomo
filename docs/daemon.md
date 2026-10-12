@@ -236,10 +236,13 @@ inline rule sets; everything else is fixed by the core:
 `apply` is all or nothing. A config that does not parse changes nothing: mihomo applies a
 config's general settings to the running engine while it parses, so the core parses in the
 running mode and sets the new one only once the config is accepted, and a value mihomo panics
-on fails the apply instead. If TUN does not come up, which mihomo only logs, or the local proxy
-port is taken while TUN is off, the core puts the previous config back, or stops, and the error
-carries the reason. Rules are written the way mihomo splits them: only logic and regex rules may
-have commas in their value, and a rule mihomo would read with another target is refused. Stopping applies an empty config: no inbounds, no TUN and no DNS. Selections
+on fails the apply instead. mihomo applies a config whatever fails on the way and only logs it,
+so the core reads its log: if TUN, the local proxy port or the Tailscale port does not come up,
+the core stops, puts the previous config back if there was one, and the error carries mihomo's
+reason. Before applying it also refuses what mihomo would accept and quietly run differently:
+a rule whose value would move its target (only logic and regex rules may have commas in their
+value), a rule set with lines mihomo cannot read, and a group interval, timeout or tolerance out
+of range, which crashes mihomo's health check. Stopping applies an empty config: no inbounds, no TUN and no DNS. Selections
 persist in `cache.db` across restarts.
 
 mihomo pins `golang.org/x/net` at a release with advisories govulncheck finds reachable; `go.mod`

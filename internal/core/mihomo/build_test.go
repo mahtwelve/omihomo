@@ -145,3 +145,18 @@ func TestRuleLine(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupNumbersAreBounded(t *testing.T) {
+	for _, v := range []any{-1, int64(-5), uint64(1 << 63), 1e18, 0.5, "300", 7*24*60*60 + 1} {
+		g := core.Group{Name: "Auto", Type: "url-test", Options: map[string]any{"interval": v}}
+		if err := checkGroupNumbers(g); err == nil {
+			t.Errorf("interval %v (%T) passed", v, v)
+		}
+	}
+	for _, v := range []any{0, 300, int64(300), float64(300)} {
+		g := core.Group{Name: "Auto", Type: "url-test", Options: map[string]any{"interval": v, "timeout": 5000, "tolerance": 50}}
+		if err := checkGroupNumbers(g); err != nil {
+			t.Errorf("interval %v (%T): %v", v, v, err)
+		}
+	}
+}

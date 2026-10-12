@@ -398,20 +398,81 @@ func TestAMalformedRegexFailsTheApply(t *testing.T) {
 	}
 }
 
-func TestATakenPortWithoutTUNFailsTheApply(t *testing.T) {
+func TestATakenPortFailsTheApply(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			c := running(t, testConfig())
+			c.Stop(t.Context())
+			addr := fmt.Sprintf("127.0.0.1:%d", mixedPort)
+			var taken io.Closer
+			var err error
+			if network == "tcp" {
+				taken, err = net.Listen("tcp", addr)
+			} else {
+				taken, err = net.ListenPacket("udp", addr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer taken.Close()
+			err = c.Apply(t.Context(), testConfig())
+			if err == nil || !strings.Contains(err.Error(), "did not open") {
+				t.Fatalf("apply with %s taken = %v", network, err)
+			}
+			if _, err := c.Groups(t.Context()); !errors.Is(err, core.ErrNotRunning) {
+				t.Errorf("the core runs with no way in: %v", err)
+			}
+		})
+	}
+}
+
+// A reload whose listener fails puts the previous config back, local
+// proxy port included.
+func TestAFailedListenerKeepsThePreviousConfig(t *testing.T) {
 	c := running(t, testConfig())
-	c.Stop(t.Context())
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort))
+	taken, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tailscalePort))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	err = c.Apply(t.Context(), testConfig())
-	if err == nil || !strings.Contains(err.Error(), "is taken") {
-		t.Fatalf("apply with the port taken = %v", err)
+	defer taken.Close()
+	withTailscale := testConfig()
+	withTailscale.Tailscale = true
+	if err := c.Apply(t.Context(), withTailscale); err == nil || !strings.Contains(err.Error(), "Tailscale") {
+		t.Fatalf("apply with the Tailscale port taken = %v", err)
 	}
-	if _, err := c.Groups(t.Context()); !errors.Is(err, core.ErrNotRunning) {
-		t.Errorf("the core runs with no way in: %v", err)
+	rules, err := c.Rules(t.Context())
+	if err != nil || len(rules) != 3 {
+		t.Fatalf("rules after the failure = %v, %v; want the previous config's", rules, err)
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort), time.Second)
+	if err != nil {
+		t.Fatalf("the local proxy port is closed after the restore: %v", err)
+	}
+	conn.Close()
+}
+
+func TestARuleSetWithUnreadableLinesFailsTheApply(t *testing.T) {
+	for _, rs := range []core.RuleSet{
+		{Name: "blocked", Behavior: "classical", Payload: []string{"DOMAIN,a.example", "GEOIP,CN"}},
+		{Name: "blocked", Behavior: "ipcidr", Payload: []string{"10.0.0.0/8", "not an address"}},
+		{Name: "blocked", Behavior: "domain", Payload: []string{"a.example", "a/b"}},
+	} {
+		cfg := testConfig()
+		cfg.Profile.RuleSets = []core.RuleSet{rs}
+		if err := shared.Apply(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "do not parse") {
+			t.Errorf("%s set with a bad line = %v", rs.Behavior, err)
+		}
+	}
+	if _, err := shared.Groups(t.Context()); !errors.Is(err, core.ErrNotRunning) {
+		t.Errorf("a refused config started the core: %v", err)
+	}
+}
+
+func TestABadIntervalFailsTheApply(t *testing.T) {
+	cfg := testConfig()
+	cfg.Profile.Groups[1].Options["interval"] = -1
+	if err := shared.Apply(t.Context(), cfg); err == nil {
+		t.Fatal("a negative health check interval applied")
 	}
 }
 

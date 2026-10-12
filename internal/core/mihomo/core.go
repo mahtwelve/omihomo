@@ -117,24 +117,47 @@ func (c *Core) Apply(ctx context.Context, cfg core.Config) error {
 	wasRunning, previous := c.running, c.current.cfg
 	c.mu.Unlock()
 
-	since := c.tap.mark()
+	stop := c.tap.watch()
 	executor.ApplyConfig(next.parsed, true)
-	if listener.GetTunConf().Enable != cfg.TUN {
-		reason := c.tap.errorSince(since, time.Second)
-		if reason == "" {
-			reason = "no reason was logged"
-		}
+	if err := started(cfg, stop()); err != nil {
 		c.restore(wasRunning, previous)
-		return fmt.Errorf("TUN did not start: %s", reason)
-	}
-	if listener.GetPorts().MixedPort == 0 {
-		if !cfg.TUN {
-			c.restore(wasRunning, previous)
-			return fmt.Errorf("the local proxy port %d is taken, and TUN is off: nothing could reach the proxy", mixedPort)
-		}
-		c.log.Warn("the local proxy port is taken; only TUN carries traffic", "port", mixedPort)
+		return err
 	}
 	c.commit(next)
+	return nil
+}
+
+// What mihomo logs, and only logs, when an inbound does not start.
+const (
+	tunFailed       = "Start TUN listening error: "
+	mixedFailed     = "Start Mixed(http+socks) server error: "
+	listenerFailedF = "Listener %s listen err: "
+)
+
+// started checks that what cfg asks for came up. mihomo applies a config
+// whatever fails on the way and only logs it, so this reads what it logged.
+func started(cfg core.Config, logged []string) error {
+	reason := func(prefix string) string {
+		for _, line := range logged {
+			if r, ok := strings.CutPrefix(line, prefix); ok {
+				return r
+			}
+		}
+		return ""
+	}
+	if listener.GetTunConf().Enable != cfg.TUN {
+		r := reason(tunFailed)
+		if r == "" {
+			r = "no reason was logged"
+		}
+		return fmt.Errorf("TUN did not start: %s", r)
+	}
+	if r := reason(mixedFailed); r != "" || listener.GetPorts().MixedPort == 0 {
+		return fmt.Errorf("the local proxy port %d did not open: %s", mixedPort, r)
+	}
+	if r := reason(fmt.Sprintf(listenerFailedF, tailscaleListener)); cfg.Tailscale && r != "" {
+		return fmt.Errorf("the Tailscale proxy port %d did not open: %s", tailscalePort, r)
+	}
 	return nil
 }
 
@@ -157,6 +180,19 @@ func prepare(cfg core.Config) (*runtime, error) {
 	parsed, err := parse(raw)
 	if err != nil {
 		return nil, err
+	}
+	// A rule set keeps the lines it can read and only logs the others,
+	// which would let through what the rest should have matched.
+	for _, rs := range cfg.Profile.RuleSets {
+		want := 0
+		for _, line := range rs.Payload {
+			if line != "" {
+				want++
+			}
+		}
+		if got := parsed.RuleProviders[rs.Name].Count(); got != want {
+			return nil, fmt.Errorf("rule set %q: %d of its %d lines do not parse", rs.Name, want-got, want)
+		}
 	}
 	rt := &runtime{cfg: cfg, parsed: parsed, rules: rules, types: map[string]string{
 		"DIRECT": "direct", "REJECT": "reject", "REJECT-DROP": "reject-drop", "PASS": "pass", "COMPATIBLE": "compatible",
@@ -203,8 +239,10 @@ func (c *Core) commit(rt *runtime) {
 }
 
 // restore puts back what ran before a failed apply: the previous config,
-// or nothing.
+// or nothing. It stops first: mihomo keeps a listener that failed halfway,
+// closed, and would not open it again for the same config.
 func (c *Core) restore(wasRunning bool, previous core.Config) {
+	c.stop()
 	if wasRunning {
 		rt, err := prepare(previous)
 		if err == nil {
@@ -217,7 +255,6 @@ func (c *Core) restore(wasRunning bool, previous core.Config) {
 		}
 		c.log.Error("restore the previous config", "err", err)
 	}
-	c.stop()
 }
 
 func (c *Core) Stop(ctx context.Context) error {

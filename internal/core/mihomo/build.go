@@ -136,6 +136,9 @@ func rawConfig(cfg core.Config) (*config.RawConfig, []protocol.Rule, error) {
 		})
 	}
 	for _, g := range groups {
+		if err := checkGroupNumbers(g); err != nil {
+			return nil, nil, err
+		}
 		m := maps.Clone(g.Options)
 		if m == nil {
 			m = map[string]any{}
@@ -175,6 +178,45 @@ func rawConfig(cfg core.Config) (*config.RawConfig, []protocol.Rule, error) {
 		listed = append(listed, protocol.Rule{Type: r.Type, Value: r.Value, Target: r.Target, Source: r.Source})
 	}
 	return raw, listed, nil
+}
+
+// groupNumbers bounds the numeric group options. mihomo turns them into
+// tickers and durations without checking them, and a health check that
+// starts with a bad one panics where nothing can recover it.
+var groupNumbers = map[string]int64{
+	"interval":         7 * 24 * 60 * 60, // seconds
+	"timeout":          5 * 60 * 1000,    // milliseconds
+	"max-failed-times": 1000,
+	"tolerance":        65535, // milliseconds
+}
+
+func checkGroupNumbers(g core.Group) error {
+	for key, limit := range groupNumbers {
+		v, ok := g.Options[key]
+		if !ok {
+			continue
+		}
+		var n int64
+		switch v := v.(type) {
+		case int:
+			n = int64(v)
+		case int64:
+			n = v
+		case uint64:
+			n = int64(min(v, uint64(limit)+1))
+		case float64:
+			if v != float64(int64(v)) {
+				return fmt.Errorf("group %q: %s is not a whole number", g.Name, key)
+			}
+			n = int64(v)
+		default:
+			return fmt.Errorf("group %q: %s is not a number", g.Name, key)
+		}
+		if n < 0 || n > limit {
+			return fmt.Errorf("group %q: %s must be between 0 and %d", g.Name, key, limit)
+		}
+	}
+	return nil
 }
 
 // primaryGroup is the group named want, else the first select group, else
