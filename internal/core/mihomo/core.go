@@ -38,9 +38,6 @@ import (
 	"github.com/readeem/omihomo/internal/protocol"
 )
 
-// Version is the mihomo release this core embeds.
-var Version = C.Version
-
 // delayURL is what a delay test fetches, as the widget always has.
 var delayURL = "http://www.gstatic.com/generate_204"
 
