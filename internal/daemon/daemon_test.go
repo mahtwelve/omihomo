@@ -652,3 +652,17 @@ func TestGroupChangesTheCoreMakesArePushed(t *testing.T) {
 		}
 	}
 }
+
+func TestACoreThatStopsOnAFailedChangeIsShownStopped(t *testing.T) {
+	h := serve(t, os.Getuid())
+	c := h.dial(t)
+	call[protocol.Status](t, c, protocol.OpStart, nil)
+	h.core.FailApply(fmt.Errorf("TUN did not start; the previous config did not come back either: %w", core.ErrStopped))
+	if err := callErr(t, c, protocol.OpSetSettings, protocol.SettingsArgs{TUN: ptr(true)}); err.Code != protocol.CodeCore {
+		t.Fatalf("failed change = %v", err)
+	}
+	st := call[protocol.Status](t, c, protocol.OpStatus, nil)
+	if st.State != protocol.StateStopped || !strings.Contains(st.Detail, "did not come back") || st.TUN {
+		t.Fatalf("status = %+v, want stopped with the reason and the old settings", st)
+	}
+}

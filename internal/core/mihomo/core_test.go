@@ -16,6 +16,7 @@ import (
 	"time"
 
 	T "github.com/metacubex/mihomo/tunnel"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/readeem/omihomo/internal/core"
 	"github.com/readeem/omihomo/internal/protocol"
@@ -483,5 +484,103 @@ func TestACancelledDialNeverConnects(t *testing.T) {
 	if conn, err := c.DialContext(ctx, "tcp", "127.0.0.1:1"); err == nil {
 		conn.Close()
 		t.Fatal("a cancelled dial connected")
+	}
+}
+
+func TestARestoreThatFailsStops(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("as root TUN would start")
+	}
+	withTailscale := testConfig()
+	withTailscale.Tailscale = true
+	c := running(t, withTailscale)
+	var taken net.Listener
+	afterRestoreStop = func() {
+		taken, _ = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tailscalePort))
+	}
+	defer func() {
+		afterRestoreStop = func() {}
+		if taken != nil {
+			taken.Close()
+		}
+	}()
+	bad := withTailscale
+	bad.Profile.RuleSets = nil
+	bad.Profile.Rules = []core.Rule{{Type: "MATCH", Target: "Proxy"}}
+	bad.TUN = true
+	err := c.Apply(t.Context(), bad)
+	if !errors.Is(err, core.ErrStopped) {
+		t.Fatalf("apply = %v, want ErrStopped", err)
+	}
+	if taken == nil {
+		t.Fatal("the test could not take the port")
+	}
+	if _, err := c.Groups(t.Context()); !errors.Is(err, core.ErrNotRunning) {
+		t.Errorf("the core claims to run: %v", err)
+	}
+}
+
+// socks5 answers a CONNECT only once released, then echoes.
+func socks5(t *testing.T, release <-chan struct{}) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, 512)
+				if _, err := io.ReadAtLeast(conn, buf, 3); err != nil {
+					return
+				}
+				conn.Write([]byte{5, 0})
+				if _, err := conn.Read(buf); err != nil {
+					return
+				}
+				<-release
+				conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+				io.Copy(conn, conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() { l.Close() })
+	return l
+}
+
+func TestADialInFlightAtStopIsClosed(t *testing.T) {
+	release := make(chan struct{})
+	upstream := socks5(t, release)
+	cfg := testConfig()
+	port := upstream.Addr().(*net.TCPAddr).Port
+	cfg.Profile.Proxies = append(cfg.Profile.Proxies, core.Proxy{Name: "Slow", Type: "socks5",
+		Options: map[string]any{"server": "127.0.0.1", "port": port}})
+	cfg.Profile.Groups[0].Members = append(cfg.Profile.Groups[0].Members, "Slow")
+	c := running(t, cfg)
+	if err := c.Select(t.Context(), "Proxy", "Slow"); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := c.DialContext(t.Context(), "tcp", "192.0.2.1:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(100 * time.Millisecond) // the dial reaches the upstream
+	if err := c.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	go io.WriteString(conn, "after-stop")
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadAll(conn); err != nil {
+		t.Fatalf("the late connection stayed open: %v", err)
+	}
+	if conns := statistic.DefaultManager.Snapshot().Connections; len(conns) != 0 {
+		t.Errorf("%d connections outlived the stop", len(conns))
 	}
 }

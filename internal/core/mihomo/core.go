@@ -45,6 +45,7 @@ var Version = C.Version
 var delayURL = "http://www.gstatic.com/generate_204"
 
 const (
+	drainTick    = 20 * time.Millisecond
 	delayTimeout = 5 * time.Second
 	// Proxies tested at once by one delay test.
 	delayParallel = 16
@@ -62,6 +63,9 @@ type Core struct {
 	mu      sync.Mutex
 	running bool
 	current *runtime
+	// generation counts commits and stops, so a drain knows when the
+	// stop it follows is over.
+	generation uint64
 }
 
 var _ core.Core = (*Core)(nil)
@@ -117,13 +121,30 @@ func (c *Core) Apply(ctx context.Context, cfg core.Config) error {
 	wasRunning, previous := c.running, c.current.cfg
 	c.mu.Unlock()
 
-	stop := c.tap.watch()
-	executor.ApplyConfig(next.parsed, true)
-	if err := started(cfg, stop()); err != nil {
-		c.restore(wasRunning, previous)
+	if err := c.run(next); err != nil {
+		if !wasRunning {
+			c.stop()
+			return err
+		}
+		if rerr := c.restore(previous); rerr != nil {
+			return fmt.Errorf("%w; the previous config did not come back either (%v): %w", err, rerr, core.ErrStopped)
+		}
 		return err
 	}
-	c.commit(next)
+	return nil
+}
+
+// afterRestoreStop lets a test act between a restore's stop and its apply.
+var afterRestoreStop = func() {}
+
+// run applies rt and commits it once everything it asks for came up.
+func (c *Core) run(rt *runtime) error {
+	stop := c.tap.watch()
+	executor.ApplyConfig(rt.parsed, true)
+	if err := started(rt.cfg, stop()); err != nil {
+		return err
+	}
+	c.commit(rt)
 	return nil
 }
 
@@ -236,25 +257,24 @@ func (c *Core) commit(rt *runtime) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.running, c.current = true, rt
+	c.generation++
 }
 
-// restore puts back what ran before a failed apply: the previous config,
-// or nothing. It stops first: mihomo keeps a listener that failed halfway,
-// closed, and would not open it again for the same config.
-func (c *Core) restore(wasRunning bool, previous core.Config) {
+// restore puts back the config that ran before a failed apply, or leaves
+// the core stopped. It stops first: mihomo keeps a listener that failed
+// halfway, closed, and would not open it again for the same config.
+func (c *Core) restore(previous core.Config) error {
 	c.stop()
-	if wasRunning {
-		rt, err := prepare(previous)
-		if err == nil {
-			executor.ApplyConfig(rt.parsed, true)
-			c.commit(rt)
-			if listener.GetTunConf().Enable != previous.TUN {
-				c.log.Error("the previous config is back without its TUN")
-			}
-			return
-		}
-		c.log.Error("restore the previous config", "err", err)
+	afterRestoreStop()
+	rt, err := prepare(previous)
+	if err == nil {
+		err = c.run(rt)
 	}
+	if err != nil {
+		c.log.Error("restore the previous config", "err", err)
+		c.stop()
+	}
+	return err
 }
 
 func (c *Core) Stop(ctx context.Context) error {
@@ -267,6 +287,8 @@ func (c *Core) Stop(ctx context.Context) error {
 func (c *Core) stop() {
 	c.mu.Lock()
 	c.running, c.current = false, &runtime{}
+	c.generation++
+	generation := c.generation
 	c.mu.Unlock()
 	parsed, err := parse(stoppedConfig())
 	if err != nil {
@@ -280,6 +302,28 @@ func (c *Core) stop() {
 		executor.ApplyConfig(parsed, true)
 	}
 	closeAll()
+	go c.drain(generation)
+}
+
+// drain closes the connections that open after a stop. mihomo dials
+// without a context it would cancel and tracks a connection only once the
+// dial is through, so a dial in flight at the stop lands later through the
+// old proxy. A dial gives up after C.DefaultTCPTimeout; until then, and
+// while the core stays stopped, whatever lands is closed. What it sends
+// within one tick of landing still gets out.
+func (c *Core) drain(generation uint64) {
+	deadline := time.Now().Add(C.DefaultTCPTimeout + time.Second)
+	tick := time.NewTicker(drainTick)
+	defer tick.Stop()
+	for now := range tick.C {
+		c.mu.Lock()
+		stopped := c.generation == generation
+		c.mu.Unlock()
+		if !stopped || now.After(deadline) {
+			return
+		}
+		closeAll()
+	}
 }
 
 func closeAll() {

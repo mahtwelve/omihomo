@@ -431,6 +431,10 @@ func (d *server) setSettings(ctx context.Context, args protocol.SettingsArgs) (a
 	if running {
 		if err := d.core.Apply(ctx, next.config(d.cfg.profile)); err != nil {
 			d.log.Error("apply settings", "err", err)
+			if errors.Is(err, core.ErrStopped) {
+				d.setState(protocol.StateStopped, err.Error())
+				d.publish(ctx)
+			}
 			return nil, coreError(err)
 		}
 	}

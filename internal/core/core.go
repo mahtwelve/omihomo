@@ -86,6 +86,10 @@ var ErrNotRunning = errors.New("the proxy is not running")
 // exist in the running config.
 var ErrNotFound = errors.New("not found")
 
+// ErrStopped is wrapped by a failed Apply that could not put the previous
+// config back either, and left the engine stopped.
+var ErrStopped = errors.New("the proxy stopped")
+
 // MaxConnections bounds the connections one snapshot lists, so a busy
 // machine's list still fits in one protocol message.
 const MaxConnections = 1000
@@ -94,7 +98,8 @@ const MaxConnections = 1000
 //
 // Apply starts the engine on cfg, or reloads a running engine onto it. A
 // failed Apply leaves the previous config running, or the engine stopped if
-// it was. Stop is idempotent. All other calls fail with ErrNotRunning while
+// it was; when the previous config cannot run again either, the engine
+// stops and the error wraps ErrStopped. Stop is idempotent. All other calls fail with ErrNotRunning while
 // stopped. Implementations must be safe for concurrent use.
 type Core interface {
 	Apply(ctx context.Context, cfg Config) error

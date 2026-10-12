@@ -4,6 +4,7 @@ package fakecore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -80,6 +81,9 @@ func (c *Core) Apply(ctx context.Context, cfg core.Config) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.applyErr != nil {
+		if errors.Is(c.applyErr, core.ErrStopped) {
+			c.running = false
+		}
 		return c.applyErr
 	}
 	if !c.running {

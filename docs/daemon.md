@@ -239,11 +239,18 @@ running mode and sets the new one only once the config is accepted, and a value 
 on fails the apply instead. mihomo applies a config whatever fails on the way and only logs it,
 so the core reads its log: if TUN, the local proxy port or the Tailscale port does not come up,
 the core stops, puts the previous config back if there was one, and the error carries mihomo's
-reason. Before applying it also refuses what mihomo would accept and quietly run differently:
-a rule whose value would move its target (only logic and regex rules may have commas in their
+reason. When the previous config does not come back either, the proxy stays stopped and the
+daemon shows it so, with both reasons in `detail`.
+
+Before applying, the core also refuses what mihomo would accept and quietly run differently: a
+rule whose value would move its target (only logic and regex rules may have commas in their
 value), a rule set with lines mihomo cannot read, and a group interval, timeout or tolerance out
-of range, which crashes mihomo's health check. Stopping applies an empty config: no inbounds, no TUN and no DNS. Selections
-persist in `cache.db` across restarts.
+of range, which crashes mihomo's health check.
+
+Stopping applies an empty config: no inbounds, no TUN and no DNS. mihomo cannot cancel a dial in
+flight and tracks a connection only once its dial is through, so for the dial timeout after a
+stop (5 seconds) the core closes whatever lands; what such a connection sends in the few
+milliseconds before that still gets out. Selections persist in `cache.db` across restarts.
 
 mihomo pins `golang.org/x/net` at a release with advisories govulncheck finds reachable; `go.mod`
 requires a newer one. It copies mihomo's `replace` of protobuf, which CI checks against mihomo's
