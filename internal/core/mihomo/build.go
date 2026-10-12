@@ -20,13 +20,7 @@ import (
 // What Omihomo runs around a subscription: everything here belongs to the
 // core, and nothing in a Profile can change it.
 const (
-	// The loopback proxy for applications that do not use TUN.
-	mixedPort = 7890
-	// The loopback proxy tailscaled dials when the Tailscale integration is
-	// on. It is Omihomo's own listener, so tailscaled's drop-in never depends
-	// on the subscription.
 	tailscaleListener = "omihomo-tailscale"
-	tailscalePort     = 7899
 	// Tailscale's interface, MagicDNS resolver and domain. Without the first,
 	// TUN routes what Tailscale already handles; without the others,
 	// dns-hijack swallows the *.ts.net lookups only Tailscale can answer.
@@ -47,6 +41,15 @@ const (
 	tunCompatibleStack = C.TunGvisor
 	// The global group, which global mode and Omihomo's own rules use.
 	globalGroup = "GLOBAL"
+)
+
+var (
+	// The loopback proxy for applications that do not use TUN.
+	mixedPort = 7890
+	// The loopback proxy tailscaled dials when the Tailscale integration is
+	// on. It is Omihomo's own listener, so tailscaled's drop-in never depends
+	// on the subscription.
+	tailscalePort = 7899
 )
 
 var defaultNameservers = []string{"https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"}
@@ -216,28 +219,48 @@ func withOmihomoRules(rules []core.Rule, cfg core.Config, primary string) []core
 	return slices.Concat(rules[:lead], own, rules[lead:])
 }
 
-// ruleLine writes r the way mihomo reads a rule. Only Value may hold commas,
-// as logic rules such as AND,((DOMAIN,a),(NETWORK,UDP)) need them; a field
-// that could shift the others is refused.
+// commaValues are the rule types whose value may hold commas: mihomo reads
+// their target from the last field and gives them no params.
+var commaValues = []string{"NOT", "OR", "AND", "SUB-RULE", "DOMAIN-REGEX", "PROCESS-NAME-REGEX", "PROCESS-PATH-REGEX"}
+
+// ruleParams are the trailing flags mihomo knows.
+var ruleParams = []string{"no-resolve", "src"}
+
+// ruleLine writes r the way mihomo splits a rule, refusing any rule whose
+// fields mihomo would read differently, such as a value whose commas move
+// the target.
 func ruleLine(r core.Rule) (string, error) {
-	fields := append([]string{r.Type, r.Target}, r.Params...)
-	for _, f := range append(fields, r.Value) {
-		if strings.ContainsAny(f, "\r\n") {
-			return "", fmt.Errorf("rule %s has a line break", r.Type)
+	bad := func(why string) (string, error) {
+		return "", fmt.Errorf("rule %s,%s,%s %s", r.Type, r.Value, r.Target, why)
+	}
+	typ := strings.ToUpper(r.Type)
+	for _, f := range append([]string{r.Type, r.Value, r.Target}, r.Params...) {
+		if strings.ContainsAny(f, "\r\n") || f != strings.TrimSpace(f) {
+			return bad("has a line break or surrounding space")
 		}
 	}
-	for _, f := range fields {
-		if f == "" || strings.Contains(f, ",") {
-			return "", fmt.Errorf("rule %s,%s,%s is malformed", r.Type, r.Value, r.Target)
+	if typ == "" || strings.Contains(typ, ",") || r.Target == "" || strings.Contains(r.Target, ",") {
+		return bad("is malformed")
+	}
+	for _, p := range r.Params {
+		if !slices.Contains(ruleParams, p) {
+			return bad("has an unknown param " + p)
 		}
 	}
-	parts := []string{r.Type}
-	if r.Value != "" {
-		parts = append(parts, r.Value)
+	switch {
+	case typ == "MATCH":
+		if r.Value != "" || len(r.Params) > 0 {
+			return bad("has a value or params, which MATCH takes none of")
+		}
+		return typ + "," + r.Target, nil
+	case slices.Contains(commaValues, typ):
+		if r.Value == "" || len(r.Params) > 0 {
+			return bad("needs a value and takes no params")
+		}
+	case r.Value == "" || strings.Contains(r.Value, ","):
+		return bad("needs a value without commas")
 	}
-	parts = append(parts, r.Target)
-	parts = append(parts, r.Params...)
-	return strings.Join(parts, ","), nil
+	return strings.Join(append([]string{typ, r.Value, r.Target}, r.Params...), ","), nil
 }
 
 // stoppedConfig is what runs while the proxy is off: no inbounds, no TUN and
@@ -246,6 +269,7 @@ func stoppedConfig() *config.RawConfig {
 	raw := config.DefaultRawConfig()
 	raw.Mode = T.Direct
 	raw.LogLevel = log.WARNING
+	raw.FindProcessMode = process.FindProcessAlways
 	raw.GeoXUrl = config.RawGeoXUrl{}
 	raw.ExternalUIURL = ""
 	raw.DNS.Enable = false

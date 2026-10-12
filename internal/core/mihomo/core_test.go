@@ -3,8 +3,10 @@ package mihomo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	T "github.com/metacubex/mihomo/tunnel"
 
 	"github.com/readeem/omihomo/internal/core"
 	"github.com/readeem/omihomo/internal/protocol"
@@ -26,6 +30,8 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+	// The real ports may belong to a mihomo already running here.
+	mixedPort, tailscalePort = freePort(), freePort()
 	shared, err = New(home, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		panic(err)
@@ -34,6 +40,15 @@ func TestMain(m *testing.M) {
 	shared.Stop(context.Background())
 	os.RemoveAll(home)
 	os.Exit(code)
+}
+
+func freePort() int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 func running(t *testing.T, cfg core.Config) *Core {
@@ -327,5 +342,85 @@ func TestAnEmptyProfileRunsDirect(t *testing.T) {
 	buf := make([]byte, 64)
 	if n, err := conn.Read(buf); err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
 		t.Fatalf("read %q, %v", buf[:n], err)
+	}
+}
+
+// mihomo applies a config's general settings to the live engine while it
+// parses; a config that never applies must not route anything meanwhile.
+func TestARejectedConfigNeverRoutes(t *testing.T) {
+	c := running(t, testConfig())
+	bad := testConfig()
+	bad.Mode = protocol.ModeDirect
+	for i := range 5000 {
+		bad.Profile.Rules = append(bad.Profile.Rules, core.Rule{Type: "DOMAIN", Value: fmt.Sprintf("d%d.example", i), Target: "Proxy"})
+	}
+	bad.Profile.Rules = append(bad.Profile.Rules, core.Rule{Type: "MATCH", Target: "Nowhere"})
+
+	done := make(chan struct{})
+	leaked := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if m := T.Mode(); m != T.Rule {
+				leaked <- m.String()
+				return
+			}
+		}
+	}()
+	err := c.Apply(t.Context(), bad)
+	close(done)
+	if err == nil {
+		t.Fatal("the bad config applied")
+	}
+	select {
+	case m := <-leaked:
+		t.Fatalf("the engine ran in %s mode while a rejected config parsed", m)
+	default:
+	}
+	if m := T.Mode(); m != T.Rule {
+		t.Errorf("mode after the failure = %s", m)
+	}
+}
+
+func TestAMalformedRegexFailsTheApply(t *testing.T) {
+	c := running(t, testConfig())
+	bad := testConfig()
+	bad.Profile.Groups[1].Options["filter"] = "["
+	if err := c.Apply(t.Context(), bad); err == nil {
+		t.Fatal("a group with a broken filter applied")
+	}
+	if _, err := c.Groups(t.Context()); err != nil {
+		t.Errorf("the previous config is gone: %v", err)
+	}
+}
+
+func TestATakenPortWithoutTUNFailsTheApply(t *testing.T) {
+	c := running(t, testConfig())
+	c.Stop(t.Context())
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	err = c.Apply(t.Context(), testConfig())
+	if err == nil || !strings.Contains(err.Error(), "is taken") {
+		t.Fatalf("apply with the port taken = %v", err)
+	}
+	if _, err := c.Groups(t.Context()); !errors.Is(err, core.ErrNotRunning) {
+		t.Errorf("the core runs with no way in: %v", err)
+	}
+}
+
+func TestACancelledDialNeverConnects(t *testing.T) {
+	c := running(t, testConfig())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if conn, err := c.DialContext(ctx, "tcp", "127.0.0.1:1"); err == nil {
+		conn.Close()
+		t.Fatal("a cancelled dial connected")
 	}
 }

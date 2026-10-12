@@ -113,47 +113,26 @@ func nameAndType(m map[string]any) (name, typ string, err error) {
 	return name, typ, nil
 }
 
+// commaValues are the rule types whose value may hold commas, as mihomo
+// reads them: the target is the last field, and there are no params.
+var commaValues = []string{"NOT", "OR", "AND", "SUB-RULE", "DOMAIN-REGEX", "PROCESS-NAME-REGEX", "PROCESS-PATH-REGEX"}
+
 // ParseRule splits a rule line such as "DOMAIN-SUFFIX,example.com,Proxy" or
-// "AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT". Source is left empty.
+// "AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT" the way mihomo does. Source is
+// left empty.
 func ParseRule(line string) (core.Rule, error) {
-	typ, rest, ok := strings.Cut(strings.TrimSpace(line), ",")
-	if !ok || typ == "" || rest == "" {
-		return core.Rule{}, fmt.Errorf("rule %q has no target", line)
+	fields := strings.Split(line, ",")
+	for i := range fields {
+		fields[i] = strings.TrimSpace(fields[i])
 	}
-	typ = strings.ToUpper(typ)
-	if typ == "MATCH" {
-		parts := strings.Split(rest, ",")
-		return core.Rule{Type: typ, Target: parts[0], Params: parts[1:]}, nil
+	typ := strings.ToUpper(fields[0])
+	switch {
+	case typ == "MATCH" && len(fields) == 2 && fields[1] != "":
+		return core.Rule{Type: typ, Target: fields[1]}, nil
+	case slices.Contains(commaValues, typ) && len(fields) >= 3 && fields[len(fields)-1] != "":
+		return core.Rule{Type: typ, Value: strings.Join(fields[1:len(fields)-1], ","), Target: fields[len(fields)-1]}, nil
+	case typ != "MATCH" && !slices.Contains(commaValues, typ) && len(fields) >= 3 && fields[1] != "" && fields[2] != "":
+		return core.Rule{Type: typ, Value: fields[1], Target: fields[2], Params: fields[3:]}, nil
 	}
-	var value string
-	if strings.HasPrefix(rest, "(") {
-		// A logic rule's value is one parenthesised list with commas inside.
-		depth, end := 0, -1
-		for i, r := range rest {
-			switch r {
-			case '(':
-				depth++
-			case ')':
-				depth--
-			}
-			if depth == 0 {
-				end = i
-				break
-			}
-		}
-		if end < 0 || end+1 >= len(rest) || rest[end+1] != ',' {
-			return core.Rule{}, fmt.Errorf("rule %q has unbalanced parentheses", line)
-		}
-		value, rest = rest[:end+1], rest[end+2:]
-	} else {
-		value, rest, ok = strings.Cut(rest, ",")
-		if !ok {
-			return core.Rule{}, fmt.Errorf("rule %q has no target", line)
-		}
-	}
-	parts := strings.Split(rest, ",")
-	if parts[0] == "" {
-		return core.Rule{}, fmt.Errorf("rule %q has no target", line)
-	}
-	return core.Rule{Type: typ, Value: value, Target: parts[0], Params: parts[1:]}, nil
+	return core.Rule{}, fmt.Errorf("rule %q is malformed", line)
 }

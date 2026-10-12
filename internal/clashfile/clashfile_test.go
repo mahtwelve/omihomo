@@ -15,8 +15,9 @@ func TestParseRule(t *testing.T) {
 	}{
 		{"DOMAIN-SUFFIX,example.com,Proxy", core.Rule{Type: "DOMAIN-SUFFIX", Value: "example.com", Target: "Proxy", Params: []string{}}},
 		{"ip-cidr,10.0.0.0/8,DIRECT,no-resolve", core.Rule{Type: "IP-CIDR", Value: "10.0.0.0/8", Target: "DIRECT", Params: []string{"no-resolve"}}},
-		{"MATCH,Proxy", core.Rule{Type: "MATCH", Target: "Proxy", Params: []string{}}},
-		{"AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT", core.Rule{Type: "AND", Value: "((DOMAIN,a.com),(NETWORK,UDP))", Target: "REJECT", Params: []string{}}},
+		{"MATCH,Proxy", core.Rule{Type: "MATCH", Target: "Proxy"}},
+		{"AND,((DOMAIN,a.com),(NETWORK,UDP)),REJECT", core.Rule{Type: "AND", Value: "((DOMAIN,a.com),(NETWORK,UDP))", Target: "REJECT"}},
+		{"DOMAIN-REGEX,^a{1,3}\\.com$,Proxy", core.Rule{Type: "DOMAIN-REGEX", Value: "^a{1,3}\\.com$", Target: "Proxy"}},
 	} {
 		got, err := ParseRule(tc.line)
 		if err != nil {
@@ -27,7 +28,7 @@ func TestParseRule(t *testing.T) {
 			t.Errorf("%s = %+v, want %+v", tc.line, got, tc.want)
 		}
 	}
-	for _, line := range []string{"", "MATCH", "DOMAIN,example.com", "DOMAIN,example.com,", "AND,((DOMAIN,a.com),REJECT"} {
+	for _, line := range []string{"", "MATCH", "MATCH,", "DOMAIN,example.com", "DOMAIN,example.com,", "AND,REJECT", "DOMAIN,,Proxy"} {
 		if r, err := ParseRule(line); err == nil {
 			t.Errorf("%q parsed as %+v", line, r)
 		}

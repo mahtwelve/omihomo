@@ -129,11 +129,16 @@ func TestRuleLine(t *testing.T) {
 		}
 	}
 	for _, r := range []core.Rule{
+		{Type: "DOMAIN", Value: "example.com,DIRECT", Target: "REJECT"},
 		{Type: "DOMAIN", Value: "a.com", Target: "Proxy,no-resolve"},
 		{Type: "DOMAIN,a.com", Target: "Proxy"},
 		{Type: "DOMAIN", Value: "a.com", Target: ""},
+		{Type: "DOMAIN", Value: "", Target: "Proxy"},
 		{Type: "DOMAIN", Value: "a.com\nMATCH,REJECT", Target: "Proxy"},
 		{Type: "DOMAIN", Value: "a.com", Target: "Proxy", Params: []string{"src,x"}},
+		{Type: "DOMAIN", Value: "a.com", Target: "Proxy", Params: []string{"DIRECT"}},
+		{Type: "AND", Value: "((DOMAIN,a.com))", Target: "Proxy", Params: []string{"no-resolve"}},
+		{Type: "MATCH", Value: "x", Target: "Proxy"},
 	} {
 		if got, err := ruleLine(r); err == nil {
 			t.Errorf("%+v was written as %q", r, got)

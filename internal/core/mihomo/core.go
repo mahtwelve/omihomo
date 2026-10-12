@@ -127,10 +127,14 @@ func (c *Core) Apply(ctx context.Context, cfg core.Config) error {
 		c.restore(wasRunning, previous)
 		return fmt.Errorf("TUN did not start: %s", reason)
 	}
-	c.commit(next)
 	if listener.GetPorts().MixedPort == 0 {
-		c.log.Warn("the local proxy port is unavailable; only TUN carries traffic", "port", mixedPort)
+		if !cfg.TUN {
+			c.restore(wasRunning, previous)
+			return fmt.Errorf("the local proxy port %d is taken, and TUN is off: nothing could reach the proxy", mixedPort)
+		}
+		c.log.Warn("the local proxy port is taken; only TUN carries traffic", "port", mixedPort)
 	}
+	c.commit(next)
 	return nil
 }
 
@@ -150,9 +154,9 @@ func prepare(cfg core.Config) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := config.ParseRawConfig(raw)
+	parsed, err := parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("the config does not parse: %w", err)
+		return nil, err
 	}
 	rt := &runtime{cfg: cfg, parsed: parsed, rules: rules, types: map[string]string{
 		"DIRECT": "direct", "REJECT": "reject", "REJECT-DROP": "reject-drop", "PASS": "pass", "COMPATIBLE": "compatible",
@@ -167,6 +171,28 @@ func prepare(cfg core.Config) (*runtime, error) {
 		}
 	}
 	return rt, nil
+}
+
+// parse parses raw without letting the running engine see any of it.
+// mihomo applies a config's general settings to the live engine while it
+// parses, so that geodata loads by them, and rolls them back afterwards.
+// Every config the core builds shares those settings but the mode, so the
+// parse runs in the live mode and the wanted one is set on the result.
+// mihomo also panics on some malformed values, such as a group's regex.
+func parse(raw *config.RawConfig) (parsed *config.Config, err error) {
+	mode := raw.Mode
+	raw.Mode = tunnel.Mode()
+	defer func() {
+		if p := recover(); p != nil {
+			parsed, err = nil, fmt.Errorf("the config does not parse: %v", p)
+		}
+	}()
+	parsed, err = config.ParseRawConfig(raw)
+	if err != nil {
+		return nil, fmt.Errorf("the config does not parse: %w", err)
+	}
+	parsed.General.Mode = mode
+	return parsed, nil
 }
 
 func (c *Core) commit(rt *runtime) {
@@ -205,7 +231,7 @@ func (c *Core) stop() {
 	c.mu.Lock()
 	c.running, c.current = false, &runtime{}
 	c.mu.Unlock()
-	parsed, err := config.ParseRawConfig(stoppedConfig())
+	parsed, err := parse(stoppedConfig())
 	if err != nil {
 		// The stopped config is fixed, so this is a bug. TUN is what must
 		// not outlive a stop: close it directly.
@@ -297,6 +323,10 @@ func member(p C.Proxy, types map[string]string) protocol.Proxy {
 }
 
 func (c *Core) Select(ctx context.Context, group, proxy string) error {
+	// A reload in between would restore the cached choice into a new
+	// selector before this one is cached.
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
 	g, err := c.group(group)
 	if err != nil {
 		return err
@@ -446,6 +476,9 @@ func (c *Core) Traffic(ctx context.Context) (protocol.Traffic, error) {
 
 func (c *Core) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if _, _, err := c.state(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	switch network {

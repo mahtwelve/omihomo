@@ -233,9 +233,13 @@ inline rule sets; everything else is fixed by the core:
 - no geodata source, so mihomo never fetches anything as root: GEOIP and GEOSITE rules need their
   files in `--home` already, or the config fails to apply.
 
-`apply` is all or nothing. A config that does not parse changes nothing. If TUN does not come up,
-which mihomo only logs, the core puts the previous config back, or stops, and the error carries
-mihomo's reason. Stopping applies an empty config: no inbounds, no TUN and no DNS. Selections
+`apply` is all or nothing. A config that does not parse changes nothing: mihomo applies a
+config's general settings to the running engine while it parses, so the core parses in the
+running mode and sets the new one only once the config is accepted, and a value mihomo panics
+on fails the apply instead. If TUN does not come up, which mihomo only logs, or the local proxy
+port is taken while TUN is off, the core puts the previous config back, or stops, and the error
+carries the reason. Rules are written the way mihomo splits them: only logic and regex rules may
+have commas in their value, and a rule mihomo would read with another target is refused. Stopping applies an empty config: no inbounds, no TUN and no DNS. Selections
 persist in `cache.db` across restarts.
 
 mihomo pins `golang.org/x/net` at a release with advisories govulncheck finds reachable; `go.mod`
