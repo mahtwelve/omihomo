@@ -4,7 +4,7 @@ import qs.Commons as Commons
 
 // Stands in for Omarchy's layer-shell KeyboardPanel, which needs a Wayland
 // compositor. It draws the same card in place, so the capture can grab it
-// offscreen. Only the API that Panel.qml uses is kept.
+// offscreen. Only the API that widget/Panel.qml uses is kept.
 Item {
   id: root
 

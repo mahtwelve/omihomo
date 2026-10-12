@@ -31,7 +31,7 @@ work=$(mktemp -d /tmp/omihomo-shots.XXXXXX)
 config=$work/config
 mkdir -p "$config/omihomo/bin" "$work/fakebin" "$work/state" "$work/out" \
   "$work/home/.local/state/omarchy/current/theme" "$work/home/.config/fontconfig"
-cp "$root"/{Panel.qml,Service.qml,Model.js,OmihomoIcon.qml} "$config/omihomo/"
+cp -r "$root/widget" "$config/omihomo/"
 cp "$here/capture.qml" "$config/shell.qml"
 cp -r "$shell/Commons" "$shell/Ui" "$config/"
 cp "$here/KeyboardPanel.qml" "$config/Ui/"

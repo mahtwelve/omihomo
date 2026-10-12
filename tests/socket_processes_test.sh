@@ -43,7 +43,7 @@ const item = Model.parseConnections(JSON.stringify({connections:[{id:"example", 
   destinationIP:"203.0.113.5", destinationPort:"443"
 }}]})).items[0];
 assert.equal(Model.enrichConnections([item], table)[0].process, "firefox");
-' "$project_root/Model.js"
+' "$project_root/widget/Model.js"
 
 printf 'udp UNCONN 0 0 0.0.0.0:53000 0.0.0.0:*\n' >>"$test_root/ss.txt"
 output=$(PATH="$test_root/bin:$PATH" "$project_root/bin/omihomo" socket-processes)
@@ -54,7 +54,7 @@ const item = Model.parseConnections(JSON.stringify({connections:[{id:"example", 
   type:"Tun", network:"udp", sourceIP:"192.168.42.10", sourcePort:"53000"
 }}]})).items[0];
 assert.equal(Model.enrichConnections([item], table)[0].process, "");
-' "$project_root/Model.js"
+' "$project_root/widget/Model.js"
 
 output=$(SOCKET_TEST_FAIL=yes PATH="$test_root/bin:$PATH" "$project_root/bin/omihomo" socket-processes)
 jq -e '.addresses == [] and .sockets == []' <<<"$output" >/dev/null

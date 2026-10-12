@@ -17,7 +17,7 @@ for suite in ping_state_test live_state_test; do
   config="$test_root/$suite"
   mkdir -p "$config/bin"
   cp "$here/$suite.qml" "$config/shell.qml"
-  cp "$project_root/Service.qml" "$project_root/Model.js" "$config/"
+  cp "$project_root/widget/Service.qml" "$project_root/widget/Model.js" "$config/"
   cp "$here/fixtures/fake-curl" "$config/bin/curl"
   cp "$here/fixtures/fake-cli" "$config/bin/omihomo-fake-cli"
   cp -r /usr/share/omarchy/shell/Commons "$config/"
