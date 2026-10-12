@@ -316,14 +316,26 @@ func (c *Core) drain(generation uint64) {
 	tick := time.NewTicker(drainTick)
 	defer tick.Stop()
 	for now := range tick.C {
-		c.mu.Lock()
-		stopped := c.generation == generation
-		c.mu.Unlock()
-		if !stopped || now.After(deadline) {
+		if !c.drainOnce(generation, now.After(deadline)) {
 			return
 		}
-		closeAll()
 	}
+}
+
+// drainOnce closes every connection if the stop of generation still
+// holds, under the apply lock, so an apply that starts the engine again
+// cannot open connections in between. It reports whether to go on.
+func (c *Core) drainOnce(generation uint64, last bool) bool {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	c.mu.Lock()
+	stopped := c.generation == generation
+	c.mu.Unlock()
+	if !stopped || last {
+		return false
+	}
+	closeAll()
+	return true
 }
 
 func closeAll() {

@@ -584,3 +584,28 @@ func TestADialInFlightAtStopIsClosed(t *testing.T) {
 		t.Errorf("%d connections outlived the stop", len(conns))
 	}
 }
+
+// A drain belongs to its stop: a start right after must keep its
+// connections.
+func TestADrainSparesTheNextStart(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	c := running(t, testConfig())
+	c.Stop(t.Context())
+	c = running(t, testConfig())
+	if err := c.Select(t.Context(), "Proxy", "Local"); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := c.DialContext(t.Context(), "tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(10 * drainTick)
+	io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	if n, err := conn.Read(buf); err != nil || !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+		t.Fatalf("read %q, %v: the old stop's drain closed the new connection", buf[:n], err)
+	}
+}
